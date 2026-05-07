@@ -1,6 +1,7 @@
 # Ignore datasets and heavy raw data
 dataset/
 data/
+organized_dataset
 *.zip
 
 # Ignore IDE files and virtual environments
