@@ -4,13 +4,13 @@ from collections import defaultdict
 from pathlib import Path
 import matplotlib.pyplot as plt
 from ipywidgets import interact, IntSlider, FloatSlider, VBox, HBox
+import random
 
 from src.utils import load_image
 
 # ─────────────────────────────────────────────────────────────
 # Serie grouping
 # ─────────────────────────────────────────────────────────────
-
 def group_paths_by_serie(image_paths):
     """
     Groups image paths by their serieID, inferred from folder structure:
@@ -27,7 +27,6 @@ def group_paths_by_serie(image_paths):
 
     return {k: sorted(v) for k, v in groups.items()}
 
-
 def get_middle_frame(serie_paths):
     """
     Returns the middle frame path from a sorted list of serie paths.
@@ -35,11 +34,49 @@ def get_middle_frame(serie_paths):
     """
     return serie_paths[len(serie_paths) // 2]
 
+# ─────────────────────────────────────────────────────────────
+# Shared grid helper
+# ─────────────────────────────────────────────────────────────
+def _sample_patient_frames(series_dict, n, seed):
+    """
+    Shared helper used by all browse_*_grid functions.
+    Selects one middle frame per patient, samples n patients randomly,
+    and returns a list of (patient_id, loaded_image) tuples.
+
+    Parameters:
+        series_dict : output of group_paths_by_serie
+        n           : number of patients to sample
+        seed        : random seed for reproducibility
+
+    Returns:
+        List of (patient_id: str, image: np.ndarray) tuples,
+        one per sampled patient. Images are already loaded into memory.
+    """
+    rng = random.Random(seed)
+
+    # Collect one middle frame path per patient
+    patients = defaultdict(list)
+    for key, frame_paths in series_dict.items():
+        patient_id = key.split("/")[0]
+        patients[patient_id].append(get_middle_frame(frame_paths))
+
+    patient_ids       = sorted(patients.keys())
+    selected          = rng.sample(patient_ids, min(n, len(patient_ids)))
+    sample_frames     = [(pid, rng.choice(patients[pid])) for pid in selected]
+
+    # Load images, skip failures
+    loaded = []
+    for pid, path in sample_frames:
+        img = load_image(path)
+        if img is not None:
+            loaded.append((pid, img))
+
+    return loaded
 
 # ─────────────────────────────────────────────────────────────
-# Core matching function
+# Histogram matching functions --> NOT CURRENTLY USED
 # ─────────────────────────────────────────────────────────────
-
+# Matching function (core) --> NOT CURRENTLY USED
 def match_to_reference(image, reference):
     """
     Matches the histogram of a grayscale image to a reference image using OpenCV.
@@ -76,11 +113,7 @@ def match_to_reference(image, reference):
     matched = cv2.LUT(image, lookup_table)
     return matched
 
-
-# ─────────────────────────────────────────────────────────────
-# Approach A — Middle frame reference (retrospective)
-# ─────────────────────────────────────────────────────────────
-
+# Middle frame reference (retrospective) --> NOT CURRENTLY USED
 def histogram_match_serie(serie_paths, reference_path=None):
     """
     [Approach A — Retrospective]
@@ -124,11 +157,7 @@ def histogram_match_serie(serie_paths, reference_path=None):
 
     return results, ref_path
 
-
-# ─────────────────────────────────────────────────────────────
-# Approach B — Fixed global reference (real-time compatible)
-# ─────────────────────────────────────────────────────────────
-
+# Fixed global reference (real-time compatible) --> NOT CURRENTLY USED
 def compute_global_reference(image_paths, n_samples=50, seed=42):
     """
     [Approach B — helper]
@@ -163,8 +192,6 @@ def compute_global_reference(image_paths, n_samples=50, seed=42):
     reference = np.mean(resized, axis=0).astype(np.uint8)
     print(f"Global reference computed from {len(resized)} images.")
     return reference
-
-
 def histogram_match_realtime(image, global_reference):
     """
     [Approach B — Real-time compatible]
@@ -181,69 +208,364 @@ def histogram_match_realtime(image, global_reference):
     return match_to_reference(image, global_reference)
 
 # ─────────────────────────────────────────────────────────────
-# Approach C — CLAHE
+# CLAHE
 # ─────────────────────────────────────────────────────────────
-
 def apply_clahe(image, clip_limit=2.0, grid_size=(8, 8)):
     # OpenCV requires clipLimit > 0
     limit = max(0.01, clip_limit)
     clahe = cv2.createCLAHE(clipLimit=limit, tileGridSize=grid_size)
     return clahe.apply(image)
 
-
 def browse_clahe_interactive(series_paths):
     """
-    Two-slider widget: One for the frame index and one for the CLAHE intensity.
+    Two-slider widget to explore CLAHE on a single serie:
+    one slider for the frame index, one for the clip limit.
     """
-
     def update(frame_idx, clip_val):
-        frame_path = series_paths[frame_idx]
-        frame = load_image(frame_path)
-
+        frame = load_image(series_paths[frame_idx])
         if frame is None:
             return
-
-        fname = Path(frame_path).name
-
-        # Apply the selected CLAHE level
-        enhanced = apply_clahe(frame, clip_limit=clip_val)
-
-        # Plotting Original vs Enhanced
-        fig, axes = plt.subplots(1, 2, figsize=(16, 8))
-
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
         axes[0].imshow(frame, cmap='gray')
-        axes[0].set_title(f"Original Frame: {fname}")
-
-        axes[1].imshow(enhanced, cmap='gray')
-        axes[1].set_title(f"CLAHE Enhanced (clip={clip_val:.1f})")
-
+        axes[0].set_title(f"Original — {Path(series_paths[frame_idx]).name}")
+        axes[1].imshow(apply_clahe(frame, clip_limit=clip_val), cmap='gray')
+        axes[1].set_title(f"CLAHE (clip={clip_val:.1f})")
         for ax in axes:
             ax.axis('off')
-
         plt.tight_layout()
         plt.show()
 
-    # Define the sliders
-    frame_slider = IntSlider(
-        min=0,
-        max=len(series_paths) - 1,
-        step=1,
-        value=len(series_paths) // 2,  # Start at middle frame
-        description='Frame'
-    )
-
-    clip_slider = FloatSlider(
-        min=0.1,
-        max=10.0,
-        step=0.1,
-        value=2.0,
-        description='Clip Limit'
-    )
-
-    # Use interact to create the UI
     interact(
         update,
-        frame_idx=frame_slider,
-        clip_val=clip_slider,
-        continuous_update=False  # Performance: only update when you let go of slider
+        frame_idx=IntSlider(min=0, max=len(series_paths)-1, step=1,
+                            value=len(series_paths)//2, description='Frame'),
+        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
+                             description='Clip Limit'),
+        continuous_update=False
     )
+
+def browse_clahe_grid(series_dict, n=9, seed=42):
+    """
+    3×3 grid with one clip limit slider.
+    Shows CLAHE result for n randomly selected patients (one frame each).
+    """
+    loaded = _sample_patient_frames(series_dict, n, seed)
+
+    def update(clip_val):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, img) in enumerate(loaded):
+            axes[i].imshow(apply_clahe(img, clip_limit=clip_val), cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(f"CLAHE grid — clip={clip_val:.1f}", fontsize=13, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+        update,
+        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
+                             description='Clip limit',
+                             style={'description_width': 'initial'},
+                             layout={'width': '500px'}),
+        continuous_update=False
+    )
+
+# ─────────────────────────────────────────────────────────────
+# Background subtraction
+# ─────────────────────────────────────────────────────────────
+def subtract_background(image, kernel_size=31):
+    """
+    Removes slow-varying background illumination using a large Gaussian blur.
+
+        background = GaussianBlur(image, kernel_size)
+        residual   = image - background
+        output     = rescaled residual to [0, 255]
+
+    Parameters:
+        image      : grayscale uint8 numpy array
+        kernel_size: Gaussian kernel size (must be odd; default 41)
+
+    Returns:
+        Background-subtracted grayscale uint8 numpy array
+    """
+    # Ensure kernel size is odd
+    ks = kernel_size if kernel_size % 2 == 1 else kernel_size + 1
+
+    # Estimate background as the low-frequency component
+    background = cv2.GaussianBlur(image.astype(np.float32), (ks, ks), 0)
+
+    # Subtract and shift to avoid negative values
+    residual = image.astype(np.float32) - background
+
+    # Rescale to full [0, 255] uint8 range
+    r_min, r_max = residual.min(), residual.max()
+    if r_max > r_min:
+        rescaled = ((residual - r_min) / (r_max - r_min) * 255).astype(np.uint8)
+    else:
+        rescaled = np.zeros_like(image)
+
+    return rescaled
+
+def browse_background_grid(series_dict, n=9, seed=42):
+    """
+    3×3 grid with one kernel size slider.
+    Shows background-subtracted result for n randomly selected patients.
+    """
+    loaded = _sample_patient_frames(series_dict, n, seed)
+
+    def update(kernel_size):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, img) in enumerate(loaded):
+            axes[i].imshow(subtract_background(img, kernel_size=kernel_size), cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(f"BG subtraction grid — k={kernel_size}px", fontsize=13, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+        update,
+        kernel_size=IntSlider(min=1, max=201, step=10, value=21,
+                              description='Kernel size',
+                              style={'description_width': 'initial'},
+                              layout={'width': '500px'}),
+        continuous_update=False
+    )
+
+def browse_bg_then_clahe_grid(series_dict, kernel_size=41, n=9, seed=42):
+    """
+    3×3 grid with a single CLAHE clip limit slider.
+    Background subtraction runs once at load time with the fixed kernel_size;
+    only CLAHE is recomputed on each slider change.
+    Shows only the final BG+CLAHE result.
+
+    Parameters:
+        series_dict : output of group_paths_by_serie
+        kernel_size : fixed Gaussian kernel for BG subtraction (set manually)
+        n           : number of patients to show (default 9)
+        seed        : random seed for reproducibility
+    """
+    # BG subtraction is fixed — precompute once
+    loaded = [(pid, subtract_background(img, kernel_size=kernel_size))
+              for pid, img in _sample_patient_frames(series_dict, n, seed)]
+
+    def update(clip_val):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, bg_sub) in enumerate(loaded):
+            axes[i].imshow(apply_clahe(bg_sub, clip_limit=clip_val), cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(f"BG sub (k={kernel_size}) → CLAHE (clip={clip_val:.1f})",
+                     fontsize=13, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+        update,
+        clip_val=FloatSlider(min=0.0, max=10.0, step=0.5, value=2.0,
+                             description='Clip limit',
+                             style={'description_width': 'initial'},
+                             layout={'width': '450px'}),
+        continuous_update=False
+    )
+
+# ─────────────────────────────────────────────────────────────
+# NLM filtering
+# ─────────────────────────────────────────────────────────────
+def apply_nlm(image, h=10, template_window=7, search_window=21):
+    """
+    Applies Non-Local Means denoising to a grayscale image.
+
+    NLM suppresses background noise while preserving thin vessel edges
+    by averaging pixels with similar patch neighborhoods across a large
+    search window, rather than just looking at local neighbors.
+
+    Parameters:
+        image          : grayscale uint8 numpy array
+        h              : filter strength — higher = more smoothing, more detail loss
+                         (default 10; try 5–15 for angiographic images)
+        template_window: size of the patch used for similarity comparison (must be odd)
+                         (default 7)
+        search_window  : size of the area searched for similar patches (must be odd)
+                         (default 21)
+
+    Returns:
+        Denoised grayscale uint8 numpy array
+    """
+    return cv2.fastNlMeansDenoising(
+        image, None,
+        h=h,
+        templateWindowSize=template_window,
+        searchWindowSize=search_window
+    )
+
+def browse_nlm_grid(series_dict, kernel_size=41, clip_limit=2.0, n=9, seed=42):
+    """
+    3×3 grid with three NLM sliders:
+        - h              : filter strength — main quality control parameter.
+                           Higher = more smoothing, more detail loss.
+        - template window: patch size for similarity comparison (must be odd).
+                           Larger = more robust but slower. Usually left at 7.
+        - search window  : area searched for similar patches (must be odd).
+                           Larger = better quality but much slower. Usually left at 21.
+
+    BG subtraction and CLAHE are fixed and precomputed once at load time;
+    only NLM is recomputed on each slider change.
+
+    Parameters:
+        series_dict : output of group_paths_by_serie
+        kernel_size : fixed BG subtraction kernel (set manually)
+        clip_limit  : fixed CLAHE clip limit (set manually)
+        n           : number of patients to show (default 9)
+        seed        : random seed for reproducibility
+    """
+    # Precompute BG sub + CLAHE once — only NLM changes with the sliders
+    loaded = [
+        (pid, apply_clahe(subtract_background(img, kernel_size=kernel_size),
+                          clip_limit=clip_limit))
+        for pid, img in _sample_patient_frames(series_dict, n, seed)
+    ]
+
+    def update(h, template_window, search_window):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, clahe_img) in enumerate(loaded):
+            axes[i].imshow(
+                apply_nlm(clahe_img, h=h,
+                          template_window=template_window,
+                          search_window=search_window),
+                cmap='gray'
+            )
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(
+            f"BG (k={kernel_size}) → CLAHE (clip={clip_limit}) → "
+            f"NLM (h={h}, tw={template_window}, sw={search_window})",
+            fontsize=11, y=1.01
+        )
+        plt.tight_layout()
+        plt.show()
+
+    slider_style  = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
+
+    interact(
+        update,
+        h=IntSlider(min=1, max=30, step=1, value=10,
+                    description='h (filter strength)',
+                    style=slider_style, layout=slider_layout),
+        template_window=IntSlider(min=3, max=15, step=2, value=7,
+                                  description='Template window',
+                                  style=slider_style, layout=slider_layout),
+        search_window=IntSlider(min=11, max=41, step=2, value=21,
+                                description='Search window',
+                                style=slider_style, layout=slider_layout),
+        continuous_update=False
+    )
+
+# ─────────────────────────────────────────────────────────────
+# Bilateral filtering
+# ─────────────────────────────────────────────────────────────
+def apply_bilateral(image, d=9, sigma_color=75, sigma_space=75):
+    """
+    Applies bilateral filtering to a grayscale image.
+
+    Unlike Gaussian blur, bilateral filtering preserves edges by weighting
+    neighbors both by spatial distance (sigma_space) and intensity similarity
+    (sigma_color), so pixels across a strong edge don't contribute to each other.
+
+    Parameters:
+        image      : grayscale uint8 numpy array
+        d          : diameter of the pixel neighborhood (default 9).
+                     If negative, it is computed from sigma_space.
+        sigma_color: intensity range — how large an intensity difference is still
+                     considered "similar". Higher = smoother, more edge blurring.
+                     (default 75; try 25–150)
+        sigma_space: spatial range — how far away pixels can be and still influence
+                     the result. Higher = larger neighborhood.
+                     (default 75; try 25–150)
+
+    Returns:
+        Filtered grayscale uint8 numpy array
+    """
+    return cv2.bilateralFilter(image, d=d, sigmaColor=sigma_color, sigmaSpace=sigma_space)
+
+def browse_bilateral_grid(series_dict, kernel_size=41, clip_limit=2.0, n=9, seed=42):
+    """
+    3×3 grid with three bilateral filter sliders:
+        - d           : neighborhood diameter
+        - sigma_color : intensity similarity range
+        - sigma_space : spatial range
+
+    BG subtraction and CLAHE are fixed and precomputed once at load time;
+    only bilateral filtering is recomputed on each slider change.
+
+    Parameters:
+        series_dict : output of group_paths_by_serie
+        kernel_size : fixed BG subtraction kernel (set manually)
+        clip_limit  : fixed CLAHE clip limit (set manually)
+        n           : number of patients to show (default 9)
+        seed        : random seed for reproducibility
+    """
+    # Precompute BG sub + CLAHE once
+    loaded = [
+        (pid, apply_clahe(subtract_background(img, kernel_size=kernel_size),
+                          clip_limit=clip_limit))
+        for pid, img in _sample_patient_frames(series_dict, n, seed)
+    ]
+
+    def update(d, sigma_color, sigma_space):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, clahe_img) in enumerate(loaded):
+            axes[i].imshow(
+                apply_bilateral(clahe_img, d=d,
+                                sigma_color=sigma_color,
+                                sigma_space=sigma_space),
+                cmap='gray'
+            )
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(
+            f"BG (k={kernel_size}) → CLAHE (clip={clip_limit}) → "
+            f"Bilateral (d={d}, σ_c={sigma_color}, σ_s={sigma_space})",
+            fontsize=11, y=1.01
+        )
+        plt.tight_layout()
+        plt.show()
+
+    slider_style  = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
+
+    interact(
+        update,
+        d=IntSlider(min=3, max=25, step=2, value=9,
+                    description='d (diameter)',
+                    style=slider_style, layout=slider_layout),
+        sigma_color=IntSlider(min=10, max=200, step=5, value=75,
+                              description='sigma_color',
+                              style=slider_style, layout=slider_layout),
+        sigma_space=IntSlider(min=10, max=200, step=5, value=75,
+                              description='sigma_space',
+                              style=slider_style, layout=slider_layout),
+        continuous_update=False
+    )
+
