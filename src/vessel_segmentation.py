@@ -244,6 +244,88 @@ def browse_frangi_interactive(series_dict, title="Frangi explorer"):
         continuous_update=False
     )
 
+def browse_frangi_interactive2(series_dict, title="Frangi explorer"):
+    """
+    series_dict: {serie_key: [np.ndarray, ...]}  ← already loaded frames
+    """
+    print("Frames already loaded. Use sliders to explore Frangi parameters.")
+
+    # No load_image needed — frames are already numpy arrays
+    cache = series_dict  # ← direct reference, no loading
+
+    _frangi_cache = {}
+
+    def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma):
+        frames = cache[serie_key]
+        frame_idx = min(frame_idx, len(frames) - 1)
+        pre = frames[frame_idx]
+
+        if pre.dtype == np.uint8:
+            pre = pre.astype(np.float32) / 255.0
+
+        # No path available, use index as label
+        fname = f"frame_{frame_idx:03d}"
+
+        if sigma_min >= sigma_max:
+            sigma_max = sigma_min + 0.5
+
+        fkey = (serie_key, frame_idx, sigma_min, sigma_max, int(sigma_steps), beta, gamma)
+        if fkey not in _frangi_cache:
+            _frangi_cache[fkey] = frangi_vesselness(
+                pre,
+                sigma_min=sigma_min,
+                sigma_max=sigma_max,
+                sigma_steps=int(sigma_steps),
+                beta=beta,
+                gamma=gamma,
+            )
+        vessel = _frangi_cache[fkey]
+
+        p95 = np.percentile(vessel, 95)
+        p99 = np.percentile(vessel, 99)
+
+        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
+        fig.suptitle(
+            f"{serie_key}  |  {fname}\n"
+            f"σ=[{sigma_min:.1f}–{sigma_max:.1f}, {int(sigma_steps)} steps]  "
+            f"β={beta:.2f}  γ={gamma:.1f}",
+            fontsize=11,
+        )
+
+        axes[0].imshow(pre, cmap="gray")
+        axes[0].set_title("① Preprocessed (CLAHE + NLM)")
+        axes[0].axis("off")
+
+        axes[1].imshow(vessel, cmap="gray")
+        axes[1].set_title("② Vesselness map (Frangi)")
+        axes[1].axis("off")
+        sm = plt.cm.ScalarMappable(cmap="gray", norm=plt.Normalize(vmin=0, vmax=1))
+        plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
+
+        axes[2].hist(vessel.ravel(), bins=256, color="steelblue", log=True)
+        axes[2].set_title("③ Vesselness histogram (log scale)")
+        axes[2].set_xlabel("Vesselness value")
+        axes[2].set_ylabel("Pixel count (log)")
+        axes[2].axvline(p95, color="orange", linestyle="--", label=f"p95 = {p95:.3f}")
+        axes[2].axvline(p99, color="green",  linestyle="--", label=f"p99 = {p99:.3f}")
+        axes[2].legend(fontsize=8)
+
+        plt.tight_layout()
+        plt.show()
+
+    max_frames = max(len(v) for v in series_dict.values())
+
+    interact(
+        update,
+        serie_key=Dropdown(options=list(series_dict.keys()), description="Serie"),
+        frame_idx=IntSlider(min=0, max=max_frames - 1, step=1, value=0, description="Frame"),
+        sigma_min=FloatSlider(min=0.5, max=5.0,  step=0.5, value=1.0,  description="σ min"),
+        sigma_max=FloatSlider(min=2.0, max=20.0, step=0.5, value=10.0, description="σ max"),
+        sigma_steps=IntSlider(min=2,   max=20,   step=1,   value=6,    description="σ steps"),
+        beta=FloatSlider(min=0.1,  max=2.0,  step=0.05, value=0.5,  description="beta (β)"),
+        gamma=FloatSlider(min=1.0, max=50.0, step=0.5,  value=15.0, description="gamma (γ)"),
+        continuous_update=False,
+    )
 
 def binarize_vessels(vesselness: np.ndarray,
                      method: str = "otsu") -> np.ndarray:
