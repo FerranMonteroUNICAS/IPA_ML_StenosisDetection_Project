@@ -8,5 +8,10 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # Based on your file explorer, your images are in 'dataset'
 RAW_IMG_DIR = os.path.join(ROOT_DIR, "organized_dataset")
 
+CLAHE_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/clahe")
+
+NLMEANS_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/nlmeans")
+
+NLMEANS_IMG_DIR_2 = os.path.join(ROOT_DIR, "preprocessing_with_denoising/nlmeans")
 # --- General Settings ---
 RANDOM_STATE = 42
