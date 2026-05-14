@@ -16,6 +16,18 @@ from src.preprocessing import (
     histogram_match_realtime
 )
 
+from skimage.filters import frangi
+from skimage.filters import sato
+from skimage.morphology import skeletonize
+from scipy.ndimage import binary_fill_holes
+from skimage import exposure
+
+from ipywidgets import interact
+from ipywidgets import IntSlider
+from ipywidgets import FloatSlider
+
+from src.utils import load_image
+
 # ─────────────────────────────────────────────────────────────
 # Quality metrics
 # ─────────────────────────────────────────────────────────────
@@ -986,31 +998,28 @@ def browse_residual_fusion_grid(
         continuous_update=False
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# Multi-scale residual fusion enhancement
-# ─────────────────────────────────────────────────────────────
 def multiscale_residual_enhancement(
     image,
     kernel_sizes=(15, 33, 65),
-    alpha=0.5,
+    alpha=1.0,
     smooth_residual=True,
     bilateral_d=5,
     bilateral_sigma_color=50,
     bilateral_sigma_space=50,
-    fusion_mode="mean"  # "mean" or "max"
+    fusion_mode="max",   # "mean" or "max"
+    invert=True
 ):
     """
-    Multi-scale dark-vessel enhancement using residual fusion.
+    Multi-scale dark vessel enhancement.
 
     Pipeline
     --------
         1. Multi-scale background estimation
         2. Dark-vessel residual extraction
-        3. Multi-scale residual fusion
+        3. Residual fusion across scales
         4. Residual smoothing
         5. Residual amplification
-        6. Fusion with original image
+        6. Optional inversion
 
     Formally
     --------
@@ -1018,9 +1027,17 @@ def multiscale_residual_enhancement(
 
         R_i = B_i - I
 
-        R_multi = fusion(R_i)
+        R_multi = max(R_i)
+        or
+        R_multi = mean(R_i)
 
-        I_enhanced = I - alpha * R_multi
+        I_enhanced = alpha * R_multi
+
+    Notes
+    -----
+    - Dark vessels produce strong positive residuals.
+    - The original image is NOT re-injected.
+    - Output behaves like a vessel-response map.
     """
 
     img_f = image.astype(np.float32)
@@ -1028,12 +1045,13 @@ def multiscale_residual_enhancement(
     residuals = []
 
     # ---------------------------------------------------------
-    # Multi-scale residual extraction
+    # 1. Multi-scale residual extraction
     # ---------------------------------------------------------
     for ks in kernel_sizes:
 
         ks = ks if ks % 2 == 1 else ks + 1
 
+        # Background estimation
         background = cv2.GaussianBlur(
             img_f,
             (ks, ks),
@@ -1049,20 +1067,25 @@ def multiscale_residual_enhancement(
         residuals.append(residual)
 
     # ---------------------------------------------------------
-    # Residual fusion
+    # 2. Multi-scale fusion
     # ---------------------------------------------------------
     if fusion_mode == "max":
 
         residual_multi = np.maximum.reduce(residuals)
 
     else:
+
         residual_multi = np.mean(residuals, axis=0)
 
+    # ---------------------------------------------------------
+    # 3. Remove weak responses
+    # ---------------------------------------------------------
     threshold = np.percentile(residual_multi, 80)
 
     residual_multi[residual_multi < threshold] = 0
+
     # ---------------------------------------------------------
-    # Residual smoothing
+    # 4. Residual smoothing
     # ---------------------------------------------------------
     if smooth_residual:
 
@@ -1082,46 +1105,50 @@ def multiscale_residual_enhancement(
         ).astype(np.float32)
 
     else:
+
         residual_smooth = residual_multi
 
     # ---------------------------------------------------------
-    # Residual amplification + fusion
+    # 5. Residual amplification only
     # ---------------------------------------------------------
-    enhanced = img_f - alpha * residual_smooth
+    enhanced = alpha * residual_smooth
 
     # ---------------------------------------------------------
-    # Clip to valid range
+    # 6. Normalize output
     # ---------------------------------------------------------
-    enhanced = np.clip(enhanced, 0, 255)
+    enhanced = cv2.normalize(
+        enhanced,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
 
-    return enhanced.astype(np.uint8)
+    enhanced = enhanced.astype(np.uint8)
+
+    # ---------------------------------------------------------
+    # 7. Optional inversion
+    # ---------------------------------------------------------
+    if invert:
+
+        enhanced = enhanced
+
+    return enhanced
 
 
-# ─────────────────────────────────────────────────────────────
-# Interactive multi-scale grid
-# ─────────────────────────────────────────────────────────────
 def browse_multiscale_residual_grid(
     series_dict,
     n=9,
     seed=42
 ):
-    """
-    Interactive comparison:
-
-        Original | Multi-scale fusion | Fusion + CLAHE
-
-    Uses three Gaussian scales:
-        small  -> fine vessels
-        medium -> medium vessels
-        large  -> large vascular structures
-    """
 
     loaded = _sample_patient_frames(series_dict, n, seed)
 
     def update(
         alpha,
         clip_limit,
-        bilateral_sigma
+        bilateral_sigma,
+        fusion_mode
     ):
 
         rows = len(loaded)
@@ -1148,7 +1175,8 @@ def browse_multiscale_residual_grid(
                 bilateral_d=5,
                 bilateral_sigma_color=bilateral_sigma,
                 bilateral_sigma_space=bilateral_sigma,
-                fusion_mode="mean"
+                fusion_mode=fusion_mode,
+                invert=True
             )
 
             # -------------------------------------------------
@@ -1170,30 +1198,28 @@ def browse_multiscale_residual_grid(
             axes[i, 0].axis('off')
 
             # -------------------------------------------------
-            # Multi-scale fusion
+            # Multi-scale response
             # -------------------------------------------------
             axes[i, 1].imshow(enhanced, cmap='gray')
             axes[i, 1].set_title(
-                f"Multi-scale fusion",
+                f"Residual map ({fusion_mode})",
                 fontsize=8
             )
             axes[i, 1].axis('off')
 
             # -------------------------------------------------
-            # Fusion + CLAHE
+            # Response + CLAHE
             # -------------------------------------------------
             axes[i, 2].imshow(clahe_img, cmap='gray')
             axes[i, 2].set_title(
-                f"Fusion + CLAHE",
+                "Residual + CLAHE",
                 fontsize=8
             )
             axes[i, 2].axis('off')
 
         plt.suptitle(
-            f"Multi-scale residual enhancement "
-            f"(α={alpha:.2f}, "
-            f"bilateral σ={bilateral_sigma}, "
-            f"CLAHE={clip_limit:.1f})",
+            f"Multi-scale residual vessel enhancement "
+            f"(fusion={fusion_mode}, α={alpha:.2f})",
             fontsize=13,
             y=1.01
         )
@@ -1210,9 +1236,9 @@ def browse_multiscale_residual_grid(
 
         alpha=FloatSlider(
             min=0.1,
-            max=2.0,
+            max=3.0,
             step=0.1,
-            value=0.5,
+            value=1.0,
             description='Residual amplification α',
             style=slider_style,
             layout=slider_layout
@@ -1236,6 +1262,1207 @@ def browse_multiscale_residual_grid(
             description='CLAHE clip limit',
             style=slider_style,
             layout=slider_layout
+        ),
+
+        fusion_mode=Dropdown(
+            options=["max", "mean"],
+            value="max",
+            description="Fusion mode",
+            style=slider_style,
+            layout=slider_layout
+        ),
+
+        continuous_update=False
+    )
+
+
+
+
+
+# ─────────────────────────────────────────────────────────────
+# preprocessing_segmentation_teresa
+# ─────────────────────────────────────────────────────────────
+
+# ============================================================
+# TEMPORAL BACKGROUND ESTIMATION
+# ============================================================
+
+def compute_temporal_median_background(frame_paths):
+    """
+    Computes temporal median background from all frames
+    in a session.
+    """
+    frames = []
+
+    for p in frame_paths:
+
+        img = load_image(p)
+
+        if img is not None:
+            frames.append(img.astype(np.float32))
+
+    if len(frames) == 0:
+        raise ValueError("No valid frames.")
+
+    stack = np.stack(frames, axis=0)
+
+    return np.median(stack, axis=0)
+
+
+def compute_temporal_mean_background(frame_paths):
+    """
+    Computes temporal mean background from all frames
+    in a session.
+    """
+    frames = []
+
+    for p in frame_paths:
+
+        img = load_image(p)
+
+        if img is not None:
+            frames.append(img.astype(np.float32))
+
+    if len(frames) == 0:
+        raise ValueError("No valid frames.")
+
+    stack = np.stack(frames, axis=0)
+
+    return np.mean(stack, axis=0)
+
+
+
+# ============================================================
+# STATIC SUBTRACTION
+# ============================================================
+
+def subtract_static_background(image, background):
+    """
+    Static subtraction:
+
+        R = I - B
+    """
+
+    img_f = image.astype(np.float32)
+
+    residual = img_f - background
+
+    residual = cv2.normalize(
+        residual,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
+
+    return residual.astype(np.uint8)
+
+
+def session_median_subtraction(image, session_paths):
+    """
+    Median-based temporal subtraction.
+    """
+
+    background = compute_temporal_median_background(
+        session_paths
+    )
+
+    return subtract_static_background(
+        image,
+        background
+    )
+
+
+def session_mean_subtraction(image, session_paths):
+    """
+    Mean-based temporal subtraction.
+    """
+
+    background = compute_temporal_mean_background(
+        session_paths
+    )
+
+    return subtract_static_background(
+        image,
+        background
+    )
+
+
+# ============================================================
+# DENOISING
+# ============================================================
+
+def apply_bilateral_filter(
+    image,
+    d=5,
+    sigma_color=50,
+    sigma_space=50
+):
+    """
+    Edge-preserving bilateral denoising.
+    """
+
+    return cv2.bilateralFilter(
+        image,
+        d=d,
+        sigmaColor=sigma_color,
+        sigmaSpace=sigma_space
+    )
+
+
+def apply_nlm_filter(
+    image,
+    h=10,
+    template_window_size=7,
+    search_window_size=21
+):
+    """
+    Non-local means denoising.
+    """
+
+    return cv2.fastNlMeansDenoising(
+        image,
+        None,
+        h=h,
+        templateWindowSize=template_window_size,
+        searchWindowSize=search_window_size
+    )
+
+
+
+# ============================================================
+# CLAHE
+# ============================================================
+
+def apply_clahe(
+    image,
+    clip_limit=2.0,
+    tile_grid_size=(8, 8)
+):
+    """
+    CLAHE contrast enhancement.
+    """
+
+    clahe = cv2.createCLAHE(
+        clipLimit=clip_limit,
+        tileGridSize=tile_grid_size
+    )
+
+    return clahe.apply(image)
+
+
+
+# ============================================================
+# FRANGI VESSELNESS
+# ============================================================
+
+def apply_frangi_filter(
+    image,
+    sigmas=(1, 2, 3),
+    black_ridges=True
+):
+    """
+    Vessel enhancement using Sato filter.
+
+    NOTE:
+    Function name is kept as apply_frangi_filter
+    so the existing grids continue working.
+    """
+
+    img_f = image.astype(np.float32) / 255.0
+
+    vesselness = sato(
+        img_f,
+        sigmas=sigmas,
+        black_ridges=black_ridges
+    )
+
+    vesselness = cv2.normalize(
+        vesselness,
+        None,
+        0,
+        255,
+        cv2.NORM_MINMAX
+    )
+
+    return vesselness.astype(np.uint8)
+
+
+# ============================================================
+# THRESHOLDING
+# ============================================================
+
+def apply_otsu_threshold(image):
+    """
+    Otsu vessel segmentation.
+    """
+
+    _, binary = cv2.threshold(
+        image,
+        0,
+        255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
+    )
+
+    return binary
+
+
+
+# ============================================================
+# SKELETONIZATION
+# ============================================================
+
+def apply_skeletonization(binary_image):
+    """
+    Skeletonizes binary vessel mask.
+    """
+
+    skeleton = skeletonize(binary_image > 0)
+
+    return (skeleton * 255).astype(np.uint8)
+
+
+
+
+# ============================================================
+# VESSEL MASK REFINEMENT
+# ============================================================
+
+def refine_vessel_mask(
+    binary_image,
+    kernel_size=5,
+    min_component_size=100
+):
+    """
+    Refines vessel segmentation mask.
+
+    Steps:
+    - Morphological closing
+    - Hole filling
+    - Small component removal
+    """
+
+    # --------------------------------------------------------
+    # Morphological closing
+    # --------------------------------------------------------
+    kernel = np.ones(
+        (kernel_size, kernel_size),
+        np.uint8
+    )
+
+    closed = cv2.morphologyEx(
+        binary_image,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    # --------------------------------------------------------
+    # Fill internal holes
+    # --------------------------------------------------------
+    filled = binary_fill_holes(
+        closed > 0
+    )
+
+    filled = (
+        filled.astype(np.uint8) * 255
+    )
+
+    # --------------------------------------------------------
+    # Remove small components
+    # --------------------------------------------------------
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        filled,
+        connectivity=8
+    )
+
+    cleaned = np.zeros_like(filled)
+
+    for label in range(1, num_labels):
+
+        area = stats[
+            label,
+            cv2.CC_STAT_AREA
+        ]
+
+        if area >= min_component_size:
+
+            cleaned[labels == label] = 255
+
+    return cleaned
+
+
+
+
+# ============================================================
+# Grid 1
+# Original | Median subtraction | Mean subtraction
+# ============================================================
+def browse_static_subtraction_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    fig, axes = plt.subplots(
+        len(selected),
+        3,
+        figsize=(10, len(selected) * 3)
+    )
+
+    if len(selected) == 1:
+        axes = np.expand_dims(axes, axis=0)
+
+    for i, (key, session_paths) in enumerate(selected):
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        median_sub = session_median_subtraction(
+            img,
+            session_paths
+        )
+
+        mean_sub = session_mean_subtraction(
+            img,
+            session_paths
+        )
+
+        images = [
+            ("Original", img),
+            ("Median subtraction", median_sub),
+            ("Mean subtraction", mean_sub),
+        ]
+
+        for j, (title, im) in enumerate(images):
+
+            axes[i, j].imshow(im, cmap="gray")
+            axes[i, j].set_title(title, fontsize=8)
+            axes[i, j].axis("off")
+
+    plt.suptitle(
+        "Static background subtraction",
+        fontsize=13
+    )
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# Grid 2
+# Original | Mean | Mean+NLM | Mean+bilateral
+# ============================================================
+def browse_mean_denoising_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        mean_sub = session_mean_subtraction(
+            img,
+            session_paths
+        )
+
+        loaded.append((img, mean_sub))
+
+    def update(
+        bilateral_sigma,
+        nlm_h
+    ):
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            4,
+            figsize=(14, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, mean_sub) in enumerate(loaded):
+
+            nlm = apply_nlm_filter(
+                mean_sub,
+                h=nlm_h
+            )
+
+            bilateral = apply_bilateral_filter(
+                mean_sub,
+                d=5,
+                sigma_color=bilateral_sigma,
+                sigma_space=bilateral_sigma
+            )
+
+            images = [
+                ("Original", original),
+                ("Mean subtraction", mean_sub),
+                ("Mean + NLM", nlm),
+                ("Mean + Bilateral", bilateral),
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(im, cmap="gray")
+                axes[i, j].set_title(title, fontsize=8)
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Mean subtraction denoising "
+            f"(NLM h={nlm_h}, bilateral σ={bilateral_sigma})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        bilateral_sigma=IntSlider(
+            min=5,
+            max=100,
+            step=5,
+            value=50,
+            description="Bilateral σ"
+        ),
+
+        nlm_h=IntSlider(
+            min=1,
+            max=30,
+            step=1,
+            value=10,
+            description="NLM h"
+        ),
+
+        continuous_update=False
+    )
+
+
+# ============================================================
+# Grid 3
+# Original | Median | Median+NLM | Median+bilateral
+# ============================================================
+def browse_median_denoising_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        median_sub = session_median_subtraction(
+            img,
+            session_paths
+        )
+
+        loaded.append((img, median_sub))
+
+    def update(
+        bilateral_sigma,
+        nlm_h
+    ):
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            4,
+            figsize=(14, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, median_sub) in enumerate(loaded):
+
+            nlm = apply_nlm_filter(
+                median_sub,
+                h=nlm_h
+            )
+
+            bilateral = apply_bilateral_filter(
+                median_sub,
+                d=5,
+                sigma_color=bilateral_sigma,
+                sigma_space=bilateral_sigma
+            )
+
+            images = [
+                ("Original", original),
+                ("Median subtraction", median_sub),
+                ("Median + NLM", nlm),
+                ("Median + Bilateral", bilateral),
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(im, cmap="gray")
+                axes[i, j].set_title(title, fontsize=8)
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Median subtraction denoising "
+            f"(NLM h={nlm_h}, bilateral σ={bilateral_sigma})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        bilateral_sigma=IntSlider(
+            min=5,
+            max=100,
+            step=5,
+            value=50,
+            description="Bilateral σ"
+        ),
+
+        nlm_h=IntSlider(
+            min=1,
+            max=30,
+            step=1,
+            value=10,
+            description="NLM h"
+        ),
+
+        continuous_update=False
+    )
+
+
+# ============================================================
+# Grid 4
+# Original | Mean+NLM+CLAHE | Mean+bilateral+CLAHE
+# ============================================================
+def browse_mean_clahe_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        mean_sub = session_mean_subtraction(
+            img,
+            session_paths
+        )
+
+        loaded.append((img, mean_sub))
+
+    def update(
+        bilateral_sigma,
+        nlm_h,
+        clip_limit
+    ):
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            3,
+            figsize=(11, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, mean_sub) in enumerate(loaded):
+
+            nlm = apply_nlm_filter(
+                mean_sub,
+                h=nlm_h
+            )
+
+            nlm_clahe = apply_clahe(
+                nlm,
+                clip_limit=clip_limit
+            )
+
+            bilateral = apply_bilateral_filter(
+                mean_sub,
+                d=5,
+                sigma_color=bilateral_sigma,
+                sigma_space=bilateral_sigma
+            )
+
+            bilateral_clahe = apply_clahe(
+                bilateral,
+                clip_limit=clip_limit
+            )
+
+            images = [
+                ("Original", original),
+                ("Mean + NLM + CLAHE", nlm_clahe),
+                ("Mean + Bilateral + CLAHE", bilateral_clahe),
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(im, cmap="gray")
+                axes[i, j].set_title(title, fontsize=8)
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Mean subtraction + CLAHE "
+            f"(clip={clip_limit:.1f})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        bilateral_sigma=IntSlider(
+            min=5,
+            max=100,
+            step=5,
+            value=50,
+            description="Bilateral σ"
+        ),
+
+        nlm_h=IntSlider(
+            min=1,
+            max=30,
+            step=1,
+            value=10,
+            description="NLM h"
+        ),
+
+        clip_limit=FloatSlider(
+            min=0.1,
+            max=5.0,
+            step=0.1,
+            value=2.0,
+            description="CLAHE clip"
+        ),
+
+        continuous_update=False
+    )
+
+
+# ============================================================
+# Grid 5
+# Original | Median+NLM+CLAHE | Median+bilateral+CLAHE
+# ============================================================
+def browse_median_clahe_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        median_sub = session_median_subtraction(
+            img,
+            session_paths
+        )
+
+        loaded.append((img, median_sub))
+
+    def update(
+        bilateral_sigma,
+        nlm_h,
+        clip_limit
+    ):
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            3,
+            figsize=(11, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, median_sub) in enumerate(loaded):
+
+            nlm = apply_nlm_filter(
+                median_sub,
+                h=nlm_h
+            )
+
+            nlm_clahe = apply_clahe(
+                nlm,
+                clip_limit=clip_limit
+            )
+
+            bilateral = apply_bilateral_filter(
+                median_sub,
+                d=5,
+                sigma_color=bilateral_sigma,
+                sigma_space=bilateral_sigma
+            )
+
+            bilateral_clahe = apply_clahe(
+                bilateral,
+                clip_limit=clip_limit
+            )
+
+            images = [
+                ("Original", original),
+                ("Median + NLM + CLAHE", nlm_clahe),
+                ("Median + Bilateral + CLAHE", bilateral_clahe),
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(im, cmap="gray")
+                axes[i, j].set_title(title, fontsize=8)
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Median subtraction + CLAHE "
+            f"(clip={clip_limit:.1f})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        bilateral_sigma=IntSlider(
+            min=5,
+            max=100,
+            step=5,
+            value=50,
+            description="Bilateral σ"
+        ),
+
+        nlm_h=IntSlider(
+            min=1,
+            max=30,
+            step=1,
+            value=10,
+            description="NLM h"
+        ),
+
+        clip_limit=FloatSlider(
+            min=0.1,
+            max=5.0,
+            step=0.1,
+            value=2.0,
+            description="CLAHE clip"
+        ),
+
+        continuous_update=False
+    )
+
+
+# ============================================================
+# Grid 6
+# MEDIAN + NLM + CLAHE + FRANGI
+# ============================================================
+
+def browse_median_frangi_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        # ----------------------------------------------------
+        # Median subtraction
+        # ----------------------------------------------------
+        median_sub = session_median_subtraction(
+            img,
+            session_paths
+        )
+
+        # ----------------------------------------------------
+        # NLM
+        # ----------------------------------------------------
+        nlm = apply_nlm_filter(
+            median_sub,
+            h=10
+        )
+
+        # ----------------------------------------------------
+        # CLAHE
+        # ----------------------------------------------------
+        clahe = apply_clahe(
+            nlm,
+            clip_limit=2
+        )
+
+        loaded.append((img, clahe))
+
+    def update(
+
+        sigma_1,
+        sigma_2,
+        sigma_3
+
+    ):
+
+        sigmas = (
+            sigma_1,
+            sigma_2,
+            sigma_3
+        )
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            5,
+            figsize=(18, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, clahe) in enumerate(loaded):
+
+            # ------------------------------------------------
+            # Frangi
+            # ------------------------------------------------
+            vesselness = apply_frangi_filter(
+                clahe,
+                sigmas=sigmas,
+                black_ridges=False
+            )
+
+            # ------------------------------------------------
+            # Threshold
+            # ------------------------------------------------
+            binary = apply_otsu_threshold(
+                vesselness
+            )
+
+            binary = refine_vessel_mask(
+                binary,
+                kernel_size=5,
+                min_component_size=100
+            )
+
+            # ------------------------------------------------
+            # Skeleton
+            # ------------------------------------------------
+            skeleton = apply_skeletonization(
+                binary
+            )
+
+            images = [
+
+                ("Original", original),
+
+                ("Median + NLM + CLAHE", clahe),
+
+                ("Frangi", vesselness),
+
+                ("Binary", binary),
+
+                ("Skeleton", skeleton),
+
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(
+                    im,
+                    cmap="gray"
+                )
+
+                axes[i, j].set_title(
+                    title,
+                    fontsize=8
+                )
+
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Median pipeline + Frangi "
+            f"(sigmas={sigmas})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        sigma_1=FloatSlider(
+            min=0.5,
+            max=5,
+            step=0.5,
+            value=1,
+            description="Sigma 1"
+        ),
+
+        sigma_2=FloatSlider(
+            min=0.5,
+            max=8,
+            step=0.5,
+            value=2,
+            description="Sigma 2"
+        ),
+
+        sigma_3=FloatSlider(
+            min=0.5,
+            max=12,
+            step=0.5,
+            value=3,
+            description="Sigma 3"
+        ),
+
+        continuous_update=False
+    )
+
+
+
+
+
+# ============================================================
+# Grid 7
+# MEAN + NLM + CLAHE + FRANGI
+# ============================================================
+
+def browse_mean_frangi_grid(
+    series_dict,
+    n=4,
+    seed=42
+):
+
+    rng = random.Random(seed)
+
+    selected = rng.sample(
+        list(series_dict.items()),
+        min(n, len(series_dict))
+    )
+
+    loaded = []
+
+    for key, session_paths in selected:
+
+        frame_path = rng.choice(session_paths)
+
+        img = load_image(frame_path)
+
+        # ----------------------------------------------------
+        # Mean subtraction
+        # ----------------------------------------------------
+        mean_sub = session_mean_subtraction(
+            img,
+            session_paths
+        )
+
+        # ----------------------------------------------------
+        # NLM
+        # ----------------------------------------------------
+        nlm = apply_nlm_filter(
+            mean_sub,
+            h=10
+        )
+
+        # ----------------------------------------------------
+        # CLAHE
+        # ----------------------------------------------------
+        clahe = apply_clahe(
+            nlm,
+            clip_limit=2
+        )
+
+        loaded.append((img, clahe))
+
+    def update(
+
+        sigma_1,
+        sigma_2,
+        sigma_3
+
+    ):
+
+        sigmas = (
+            sigma_1,
+            sigma_2,
+            sigma_3
+        )
+
+        fig, axes = plt.subplots(
+            len(loaded),
+            5,
+            figsize=(18, len(loaded) * 3)
+        )
+
+        if len(loaded) == 1:
+            axes = np.expand_dims(axes, axis=0)
+
+        for i, (original, clahe) in enumerate(loaded):
+
+            # ------------------------------------------------
+            # Frangi
+            # ------------------------------------------------
+            vesselness = apply_frangi_filter(
+                clahe,
+                sigmas=sigmas,
+                black_ridges=False
+            )
+
+            # ------------------------------------------------
+            # Threshold
+            # ------------------------------------------------
+            binary = apply_otsu_threshold(
+                vesselness
+            )
+
+            binary = refine_vessel_mask(
+                binary,
+                kernel_size=5,
+                min_component_size=100
+            )
+
+            # ------------------------------------------------
+            # Skeleton
+            # ------------------------------------------------
+            skeleton = apply_skeletonization(
+                binary
+            )
+
+            images = [
+
+                ("Original", original),
+
+                ("Mean + NLM + CLAHE", clahe),
+
+                ("Frangi", vesselness),
+
+                ("Binary", binary),
+
+                ("Skeleton", skeleton),
+
+            ]
+
+            for j, (title, im) in enumerate(images):
+
+                axes[i, j].imshow(
+                    im,
+                    cmap="gray"
+                )
+
+                axes[i, j].set_title(
+                    title,
+                    fontsize=8
+                )
+
+                axes[i, j].axis("off")
+
+        plt.suptitle(
+            f"Mean pipeline + Frangi "
+            f"(sigmas={sigmas})",
+            fontsize=13
+        )
+
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+
+        update,
+
+        sigma_1=FloatSlider(
+            min=0.5,
+            max=5,
+            step=0.5,
+            value=1,
+            description="Sigma 1"
+        ),
+
+        sigma_2=FloatSlider(
+            min=0.5,
+            max=8,
+            step=0.5,
+            value=2,
+            description="Sigma 2"
+        ),
+
+        sigma_3=FloatSlider(
+            min=0.5,
+            max=12,
+            step=0.5,
+            value=3,
+            description="Sigma 3"
         ),
 
         continuous_update=False
