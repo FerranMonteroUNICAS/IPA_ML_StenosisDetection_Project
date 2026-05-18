@@ -2,6 +2,7 @@
 dataset/
 data/
 organized_dataset/
+dataset_subtracted
 *.zip
 
 # Ignore IDE files and virtual environments

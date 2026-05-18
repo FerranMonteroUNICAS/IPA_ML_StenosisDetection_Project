@@ -255,7 +255,7 @@ def browse_frangi_interactive2(series_dict, title="Frangi explorer"):
 
     _frangi_cache = {}
 
-    def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma):
+    def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma, black_ridges=True):
         frames = cache[serie_key]
         frame_idx = min(frame_idx, len(frames) - 1)
         pre = frames[frame_idx]

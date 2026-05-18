@@ -6,7 +6,7 @@ ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # --- Data Paths ---
 # Based on your file explorer, your images are in 'dataset'
-RAW_IMG_DIR = os.path.join(ROOT_DIR, "organized_dataset")
+RAW_IMG_DIR = os.path.join(ROOT_DIR, "dataset_subtracted")
 
 CLAHE_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/clahe")
 

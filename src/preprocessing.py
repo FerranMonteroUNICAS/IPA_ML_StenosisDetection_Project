@@ -6,72 +6,9 @@ import matplotlib.pyplot as plt
 from ipywidgets import interact, IntSlider, FloatSlider, VBox, HBox
 import random
 
-from src.utils import load_image
+from src.utils import *
+from utils import _sample_patient_frames
 
-# ─────────────────────────────────────────────────────────────
-# Serie grouping
-# ─────────────────────────────────────────────────────────────
-def group_paths_by_serie(image_paths):
-    """
-    Groups image paths by their serieID, inferred from folder structure:
-        .../patientID/serieID/filename.png
-
-    Returns:
-        dict mapping 'patientID/serieID' → sorted list of paths
-    """
-    groups = defaultdict(list)
-    for path in image_paths:
-        parts = Path(path).parts
-        serie_key = f"{parts[-3]}/{parts[-2]}"
-        groups[serie_key].append(path)
-
-    return {k: sorted(v) for k, v in groups.items()}
-
-def get_middle_frame(serie_paths):
-    """
-    Returns the middle frame path from a sorted list of serie paths.
-    This is the frame where the contrast agent is typically best visualised.
-    """
-    return serie_paths[len(serie_paths) // 2]
-
-# ─────────────────────────────────────────────────────────────
-# Shared grid helper
-# ─────────────────────────────────────────────────────────────
-def _sample_patient_frames(series_dict, n, seed):
-    """
-    Shared helper used by all browse_*_grid functions.
-    Selects one middle frame per patient, samples n patients randomly,
-    and returns a list of (patient_id, loaded_image) tuples.
-
-    Parameters:
-        series_dict : output of group_paths_by_serie
-        n           : number of patients to sample
-        seed        : random seed for reproducibility
-
-    Returns:
-        List of (patient_id: str, image: np.ndarray) tuples,
-        one per sampled patient. Images are already loaded into memory.
-    """
-    rng = random.Random(seed)
-
-    # Collect one middle frame path per patient
-    patients = defaultdict(list)
-    for key, frame_paths in series_dict.items():
-        patient_id = key.split("/")[0]
-        patients[patient_id].append(get_middle_frame(frame_paths))
-
-    patient_ids       = sorted(patients.keys())
-    selected          = rng.sample(patient_ids, min(n, len(patient_ids)))
-    sample_frames     = [(pid, rng.choice(patients[pid])) for pid in selected]
-
-    # Load images, skip failures
-    loaded = []
-    for pid, path in sample_frames:
-        img = load_image(path)
-        if img is not None:
-            loaded.append((pid, img))
-
-    return loaded
 
 # ─────────────────────────────────────────────────────────────
 # Histogram matching functions --> NOT CURRENTLY USED
@@ -192,6 +129,7 @@ def compute_global_reference(image_paths, n_samples=50, seed=42):
     reference = np.mean(resized, axis=0).astype(np.uint8)
     print(f"Global reference computed from {len(resized)} images.")
     return reference
+
 def histogram_match_realtime(image, global_reference):
     """
     [Approach B — Real-time compatible]
@@ -206,73 +144,6 @@ def histogram_match_realtime(image, global_reference):
         Histogram-matched grayscale uint8 numpy array
     """
     return match_to_reference(image, global_reference)
-
-# ─────────────────────────────────────────────────────────────
-# CLAHE
-# ─────────────────────────────────────────────────────────────
-def apply_clahe(image, clip_limit=2.0, grid_size=(8, 8)):
-    # OpenCV requires clipLimit > 0
-    limit = max(0.01, clip_limit)
-    clahe = cv2.createCLAHE(clipLimit=limit, tileGridSize=grid_size)
-    return clahe.apply(image)
-
-def browse_clahe_interactive(series_paths):
-    """
-    Two-slider widget to explore CLAHE on a single serie:
-    one slider for the frame index, one for the clip limit.
-    """
-    def update(frame_idx, clip_val):
-        frame = load_image(series_paths[frame_idx])
-        if frame is None:
-            return
-        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
-        axes[0].imshow(frame, cmap='gray')
-        axes[0].set_title(f"Original — {Path(series_paths[frame_idx]).name}")
-        axes[1].imshow(apply_clahe(frame, clip_limit=clip_val), cmap='gray')
-        axes[1].set_title(f"CLAHE (clip={clip_val:.1f})")
-        for ax in axes:
-            ax.axis('off')
-        plt.tight_layout()
-        plt.show()
-
-    interact(
-        update,
-        frame_idx=IntSlider(min=0, max=len(series_paths)-1, step=1,
-                            value=len(series_paths)//2, description='Frame'),
-        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
-                             description='Clip Limit'),
-        continuous_update=False
-    )
-
-def browse_clahe_grid(series_dict, n=9, seed=42):
-    """
-    3×3 grid with one clip limit slider.
-    Shows CLAHE result for n randomly selected patients (one frame each).
-    """
-    loaded = _sample_patient_frames(series_dict, n, seed)
-
-    def update(clip_val):
-        rows = int(np.ceil(len(loaded) / 3))
-        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
-        axes = axes.flatten()
-        for i, (pid, img) in enumerate(loaded):
-            axes[i].imshow(apply_clahe(img, clip_limit=clip_val), cmap='gray')
-            axes[i].set_title(f"P{pid}", fontsize=8)
-            axes[i].axis('off')
-        for j in range(len(loaded), len(axes)):
-            axes[j].axis('off')
-        plt.suptitle(f"CLAHE grid — clip={clip_val:.1f}", fontsize=13, y=1.01)
-        plt.tight_layout()
-        plt.show()
-
-    interact(
-        update,
-        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
-                             description='Clip limit',
-                             style={'description_width': 'initial'},
-                             layout={'width': '500px'}),
-        continuous_update=False
-    )
 
 # ─────────────────────────────────────────────────────────────
 # Background subtraction
@@ -341,7 +212,74 @@ def browse_background_grid(series_dict, n=9, seed=42):
         continuous_update=False
     )
 
-def browse_bg_then_clahe_grid(series_dict, kernel_size=41, n=9, seed=42):
+# ─────────────────────────────────────────────────────────────
+# CLAHE
+# ─────────────────────────────────────────────────────────────
+def apply_clahe(image, clip_limit=2.0, grid_size=(8, 8)):
+    # OpenCV requires clipLimit > 0
+    limit = max(0.01, clip_limit)
+    clahe = cv2.createCLAHE(clipLimit=limit, tileGridSize=grid_size)
+    return clahe.apply(image)
+
+def browse_clahe_interactive(series_paths):
+    """
+    Two-slider widget to explore CLAHE on a single serie:
+    one slider for the frame index, one for the clip limit.
+    """
+    def update(frame_idx, clip_val):
+        frame = load_image(series_paths[frame_idx])
+        if frame is None:
+            return
+        fig, axes = plt.subplots(1, 2, figsize=(12, 6))
+        axes[0].imshow(frame, cmap='gray')
+        axes[0].set_title(f"Original — {Path(series_paths[frame_idx]).name}")
+        axes[1].imshow(apply_clahe(frame, clip_limit=clip_val), cmap='gray')
+        axes[1].set_title(f"CLAHE (clip={clip_val:.1f})")
+        for ax in axes:
+            ax.axis('off')
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+        update,
+        frame_idx=IntSlider(min=0, max=len(series_paths)-1, step=1,
+                            value=len(series_paths)//2, description='Frame'),
+        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
+                             description='Clip Limit'),
+        continuous_update=False
+    )
+
+def browse_clahe_grid(series_dict, n=9, seed=42):
+    """
+    3×3 grid with one clip limit slider.
+    Shows CLAHE result for n randomly selected patients (one frame each).
+    """
+    loaded = _sample_patient_frames(series_dict, n, seed)
+
+    def update(clip_val):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+        for i, (pid, img) in enumerate(loaded):
+            axes[i].imshow(apply_clahe(img, clip_limit=clip_val), cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+        plt.suptitle(f"CLAHE grid — clip={clip_val:.1f}", fontsize=13, y=1.01)
+        plt.tight_layout()
+        plt.show()
+
+    interact(
+        update,
+        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=2.0,
+                             description='Clip limit',
+                             style={'description_width': 'initial'},
+                             layout={'width': '500px'}),
+        continuous_update=False
+    )
+
+def browse_bg_clahe_grid(series_dict, kernel_size=41, n=9, seed=42):
     """
     3×3 grid with a single CLAHE clip limit slider.
     Background subtraction runs once at load time with the fixed kernel_size;
@@ -570,132 +508,9 @@ def browse_bilateral_grid(series_dict, kernel_size=41, clip_limit=2.0, n=9, seed
         continuous_update=False
     )
 
-
-# ─────────────────────────────────────────────────────────────
-# Grid export
-# ─────────────────────────────────────────────────────────────
-
-def save_grid(series_dict, output_path, pipeline_fn, n=9, seed=42, dpi=150, **pipeline_kwargs):
-    """
-    Renders a 3×3 grid of preprocessed patient images and saves it as a PNG.
-    Decoupled from the interactive browse functions — call it any time with
-    whichever pipeline function and parameters you have settled on.
-
-    Parameters:
-        series_dict  : output of group_paths_by_serie
-        output_path  : full path for the saved PNG (e.g. 'output/grid_bgclahe.png')
-        pipeline_fn  : a function (image) → processed image, built from your
-                       chosen pipeline steps. See examples below.
-        n            : number of patients in the grid (default 9)
-        seed         : random seed — use the same seed as your browse calls
-                       to get the same patients
-        dpi          : image resolution (default 150; increase for publication)
-        **pipeline_kwargs: not used directly — bake parameters into pipeline_fn
-                           via a lambda (see examples)
-
-    Examples:
-        # BG subtraction only
-        save_grid(series, 'output/grid_bg.png',
-                  pipeline_fn=lambda img: subtract_background(img, kernel_size=41))
-
-        # BG sub → CLAHE
-        save_grid(series, 'output/grid_bgclahe.png',
-                  pipeline_fn=lambda img: apply_clahe(
-                      subtract_background(img, kernel_size=41), clip_limit=2.0))
-
-        # Full pipeline: BG sub → CLAHE → NLM
-        save_grid(series, 'output/grid_full_nlm.png',
-                  pipeline_fn=lambda img: apply_nlm(
-                      apply_clahe(
-                          subtract_background(img, kernel_size=41), clip_limit=2.0),
-                      h=10, template_window=7, search_window=21))
-
-        # Full pipeline: BG sub → CLAHE → Bilateral
-        save_grid(series, 'output/grid_full_bilateral.png',
-                  pipeline_fn=lambda img: apply_bilateral(
-                      apply_clahe(
-                          subtract_background(img, kernel_size=41), clip_limit=2.0),
-                      d=9, sigma_color=75, sigma_space=75))
-    """
-    loaded = _sample_patient_frames(series_dict, n, seed)
-    cols = 3
-    rows = int(np.ceil(len(loaded) / cols))
-
-    fig, axes = plt.subplots(rows, cols, figsize=(cols * 3.5, rows * 3.5))
-    axes = axes.flatten()
-
-    for i, (pid, img) in enumerate(loaded):
-        axes[i].imshow(pipeline_fn(img), cmap='gray')
-        axes[i].set_title(f"P{pid}", fontsize=9)
-        axes[i].axis('off')
-
-    for j in range(len(loaded), len(axes)):
-        axes[j].axis('off')
-
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    plt.tight_layout()
-    fig.savefig(output_path, dpi=dpi, bbox_inches='tight')
-    plt.close(fig)
-    print(f"Grid saved → {output_path}")
-
-
-def save_single(series_dict, output_dir, pipeline_fn, positions, seed=42, dpi=300):
-    """
-    Saves selected images from the 3×3 grid as individual PNG files.
-    Each selected position is saved as a separate file named by patient ID.
-
-    Grid positions are 1-indexed, left-to-right, top-to-bottom:
-        1  2  3
-        4  5  6
-        7  8  9
-
-    Parameters:
-        series_dict : output of group_paths_by_serie
-        output_dir  : folder where the images will be saved
-        pipeline_fn : a function (image) → processed image (same as save_grid)
-        positions   : list of 1-indexed grid positions to save (e.g. [1, 5, 9])
-        seed        : random seed — use the same as save_grid to get the same patients
-        dpi         : image resolution (default 300)
-
-    Example:
-        save_single(series, 'output/singles',
-                    pipeline_fn=lambda img: apply_nlm(
-                        apply_clahe(
-                            subtract_background(img, kernel_size=41), clip_limit=2.0),
-                        h=10, template_window=7, search_window=21),
-                    positions=[1, 5, 9])
-    """
-    loaded = _sample_patient_frames(series_dict, n=9, seed=seed)
-
-    invalid = [p for p in positions if p < 1 or p > len(loaded)]
-    if invalid:
-        raise ValueError(f"Positions {invalid} are out of range. "
-                         f"Valid range is 1–{len(loaded)}.")
-
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    for pos in positions:
-        pid, img = loaded[pos - 1]  # convert 1-indexed to 0-indexed
-
-        fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-        ax.imshow(pipeline_fn(img), cmap='gray')
-        ax.set_title(f"P{pid}", fontsize=10)
-        ax.axis('off')
-
-        plt.tight_layout()
-        out_path = output_dir / f"P{pid}.png"
-        fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
-        plt.close(fig)
-        print(f"  Saved → {out_path}")
-
-
 # ─────────────────────────────────────────────────────────────
 # Reordered pipeline: BG subtraction → NLM → CLAHE
 # ─────────────────────────────────────────────────────────────
-
 def browse_bg_nlm_clahe_grid(series_dict, n=9, seed=42):
     """
     Interactive 3×3 grid for the reordered pipeline:
@@ -768,3 +583,100 @@ def browse_bg_nlm_clahe_grid(series_dict, n=9, seed=42):
                              style=slider_style, layout=slider_layout),
         continuous_update=False
     )
+
+def preprocess_bs_clahe_nlm(img, kernel_size=41, clip_limit=2.0, h=10):
+    return apply_nlm(apply_clahe(subtract_background(img, kernel_size=kernel_size), clip_limit=clip_limit), h=h)
+
+def preprocess_bs_nlm_clahe(img, kernel_size=41, h=10, clip_limit=2.0):
+    return apply_clahe(apply_nlm(subtract_background(img, kernel_size=kernel_size), h=h), clip_limit=clip_limit)
+
+
+# ─────────────────────────────────────────────────────────────
+# Morphological Bottom-Hat Pipeline (Alternative to Gaussian BS)
+# ─────────────────────────────────────────────────────────────
+
+def apply_bottom_hat(image, radius=15):
+    """
+    Applies a Morphological Bottom-Hat (Black Top-Hat) transform using a
+    circular structuring element. This isolates dark features (vessels) from
+    a light background and outputs them as bright structures on a dark background.
+
+    Parameters:
+        image  : grayscale uint8 numpy array
+        radius : radius of the circular structuring element (disk) in pixels
+    """
+    # Create a circular (ellipse) structuring element of size (2r+1) x (2r+1)
+    size = 2 * radius + 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (size, size))
+
+    # Bottom-Hat = Closing(Image) - Image
+    return cv2.morphologyEx(image, cv2.MORPH_BLACKHAT, kernel)
+
+
+def browse_bottomhat_nlm_clahe_grid(series_dict, n=9, seed=42):
+    """
+    Interactive 3×3 grid browser for the morphological pipeline:
+        Bottom-Hat Transform → NLM Denoising → CLAHE Enhancement
+
+    Sliders:
+        - Radius (r)   : Radius of the disk structuring element. Must be slightly
+                         larger than the thickest vessel you wish to keep.
+        - h            : NLM filter strength.
+        - Clip limit   : CLAHE local contrast amplification limit.
+    """
+    # Load raw images once
+    loaded = _sample_patient_frames(series_dict, n, seed)
+
+    def update(radius, h, clip_val):
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+
+        for i, (pid, img) in enumerate(loaded):
+            # 1. Bottom-Hat isolates dark vessels and converts them to bright features
+            bhat = apply_bottom_hat(img, radius=radius)
+            # 2. Denoise the bright feature space
+            denoised = apply_nlm(bhat, h=h)
+            # 3. Enhance local contrast
+            result = apply_clahe(denoised, clip_limit=clip_val)
+
+            axes[i].imshow(result, cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+
+        plt.suptitle(
+            f"Bottom-Hat (r={radius}px) → NLM (h={h}) → CLAHE (clip={clip_val:.1f})",
+            fontsize=12, y=1.01
+        )
+        plt.tight_layout()
+        plt.show()
+
+    slider_style = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
+
+    interact(
+        update,
+        radius=IntSlider(min=3, max=45, step=2, value=15,
+                         description='Disk Radius (r)',
+                         style=slider_style, layout=slider_layout),
+        h=IntSlider(min=1, max=30, step=1, value=8,
+                    description='NLM strength (h)',
+                    style=slider_style, layout=slider_layout),
+        clip_val=FloatSlider(min=0.1, max=10.0, step=0.1, value=4.0,
+                             description='Clip limit',
+                             style=slider_style, layout=slider_layout),
+        continuous_update=False
+    )
+
+
+def preprocess_bottomhat_nlm_clahe(img, radius=15, h=8, clip_limit=4.0):
+    """
+    Production pipeline utilizing morphological bottom-hat background elimination.
+    Outputs bright vessels over a dark background.
+    """
+    bhat = apply_bottom_hat(img, radius=radius)
+    denoised = apply_nlm(bhat, h=h)
+    return apply_clahe(denoised, clip_limit=clip_limit)
