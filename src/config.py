@@ -13,5 +13,9 @@ CLAHE_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/clahe")
 NLMEANS_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/nlmeans")
 
 NLMEANS_IMG_DIR_2 = os.path.join(ROOT_DIR, "preprocessing_with_denoising/nlmeans")
+
+# --- New Dataset Path ---
+ORGANIZED_IMG_DIR = os.path.join(ROOT_DIR, "organized_dataset")
+
 # --- General Settings ---
 RANDOM_STATE = 42

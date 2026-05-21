@@ -7,7 +7,7 @@ from ipywidgets import interact, IntSlider, FloatSlider, VBox, HBox
 import random
 
 from src.utils import *
-from utils import _sample_patient_frames
+from src.utils import _sample_patient_frames
 
 
 # ─────────────────────────────────────────────────────────────
