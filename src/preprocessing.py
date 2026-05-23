@@ -5,145 +5,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 from ipywidgets import interact, IntSlider, FloatSlider, VBox, HBox
 import random
-
 from src.utils import *
 from src.utils import _sample_patient_frames
-
-
-# ─────────────────────────────────────────────────────────────
-# Histogram matching functions --> NOT CURRENTLY USED
-# ─────────────────────────────────────────────────────────────
-# Matching function (core) --> NOT CURRENTLY USED
-def match_to_reference(image, reference):
-    """
-    Matches the histogram of a grayscale image to a reference image using OpenCV.
-
-    Parameters:
-        image    : grayscale uint8 numpy array (source)
-        reference: grayscale uint8 numpy array (target histogram)
-
-    Returns:
-        Histogram-matched grayscale uint8 numpy array
-    """
-    # 1. Calculate histograms for both images
-    # We use 256 bins for values 0-255
-    src_hist = cv2.calcHist([image], [0], None, [256], [0, 256])
-    ref_hist = cv2.calcHist([reference], [0], None, [256], [0, 256])
-
-    # 2. Calculate Cumulative Distribution Functions (CDF)
-    src_cdf = src_hist.cumsum()
-    src_cdf_normalized = src_cdf / src_cdf.max()
-
-    ref_cdf = ref_hist.cumsum()
-    ref_cdf_normalized = ref_cdf / ref_cdf.max()
-
-    # 3. Create a Lookup Table (LUT)
-    # We map each intensity value (0-255) from the source to the reference
-    lookup_table = np.zeros(256, dtype=np.uint8)
-    for i in range(256):
-        # Find the pixel value in the reference CDF that is closest to the
-        # current value in the source CDF.
-        diff = np.abs(ref_cdf_normalized - src_cdf_normalized[i])
-        lookup_table[i] = np.argmin(diff)
-
-    # 4. Apply the mapping using OpenCV's LUT function
-    matched = cv2.LUT(image, lookup_table)
-    return matched
-
-# Middle frame reference (retrospective) --> NOT CURRENTLY USED
-def histogram_match_serie(serie_paths, reference_path=None):
-    """
-    [Approach A — Retrospective]
-    Matches all frames in a serie to the middle frame's histogram.
-    Requires all frames to be available upfront — NOT suitable for real-time.
-
-    Parameters:
-        serie_paths   : sorted list of image paths for one serie
-        reference_path: optional path override. If None, middle frame is used.
-
-    Returns:
-        results  : list of dicts per frame:
-                       'path'     : original image path
-                       'original' : original grayscale numpy array
-                       'matched'  : histogram-matched grayscale numpy array
-                       'is_ref'   : True if this frame is the reference
-        ref_path : path of the frame used as reference
-    """
-    ref_path = reference_path if reference_path else get_middle_frame(serie_paths)
-    ref_image = load_image(ref_path)
-    if ref_image is None:
-        raise ValueError(f"Could not load reference image: {ref_path}")
-
-    results = []
-    for path in serie_paths:
-        image = load_image(path)
-        if image is None:
-            print(f"  [WARN] Could not load: {path}")
-            continue
-
-        is_ref = (Path(path) == Path(ref_path))
-        # Use our OpenCV implementation
-        matched = ref_image.copy() if is_ref else match_to_reference(image, ref_image)
-
-        results.append({
-            'path': path,
-            'original': image,
-            'matched': matched,
-            'is_ref': is_ref,
-        })
-
-    return results, ref_path
-
-# Fixed global reference (real-time compatible) --> NOT CURRENTLY USED
-def compute_global_reference(image_paths, n_samples=50, seed=42):
-    """
-    [Approach B — helper]
-    Computes a global reference image by averaging the histograms of a
-    random sample of images across the entire dataset.
-    Run this ONCE offline to produce a fixed reference for real-time use.
-
-    Parameters:
-        image_paths: full list of dataset image paths
-        n_samples  : number of images to sample for averaging (default 50)
-        seed       : random seed for reproducibility
-
-    Returns:
-        reference: grayscale uint8 numpy array (mean image of the sample)
-    """
-    rng = np.random.default_rng(seed)
-    sampled = rng.choice(image_paths, size=min(n_samples, len(image_paths)), replace=False)
-
-    stack = []
-    for path in sampled:
-        img = load_image(path)
-        if img is not None:
-            stack.append(img.astype(np.float32))
-
-    if not stack:
-        raise ValueError("No images could be loaded for reference computation.")
-
-    h, w = stack[0].shape
-    resized = [img if img.shape == (h, w) else
-               cv2.resize(img, (w, h)) for img in stack]
-
-    reference = np.mean(resized, axis=0).astype(np.uint8)
-    print(f"Global reference computed from {len(resized)} images.")
-    return reference
-
-def histogram_match_realtime(image, global_reference):
-    """
-    [Approach B — Real-time compatible]
-    Matches a single frame to a precomputed global reference histogram.
-    Can be applied to frames one at a time without needing the full serie.
-
-    Parameters:
-        image           : grayscale uint8 numpy array (single incoming frame)
-        global_reference: grayscale uint8 numpy array (precomputed offline)
-
-    Returns:
-        Histogram-matched grayscale uint8 numpy array
-    """
-    return match_to_reference(image, global_reference)
 
 # ─────────────────────────────────────────────────────────────
 # Background subtraction
@@ -584,17 +447,18 @@ def browse_bg_nlm_clahe_grid(series_dict, n=9, seed=42):
         continuous_update=False
     )
 
-def preprocess_bs_clahe_nlm(img, kernel_size=41, clip_limit=2.0, h=10):
+# ─────────────────────────────────────────────────────────────
+# Image Pre-Processing functions:
+# ─────────────────────────────────────────────────────────────
+def preprocess_bs_clahe_nlm(img, kernel_size=81, clip_limit=4.0, h=8):
     return apply_nlm(apply_clahe(subtract_background(img, kernel_size=kernel_size), clip_limit=clip_limit), h=h)
 
-def preprocess_bs_nlm_clahe(img, kernel_size=41, h=10, clip_limit=2.0):
+def preprocess_bs_nlm_clahe(img, kernel_size=81, h=8, clip_limit=4.0):
     return apply_clahe(apply_nlm(subtract_background(img, kernel_size=kernel_size), h=h), clip_limit=clip_limit)
 
-
 # ─────────────────────────────────────────────────────────────
-# Morphological Bottom-Hat Pipeline (Alternative to Gaussian BS)
+# Morphological Bottom-Hat Pipeline (Alternative to Gaussian BS) --> NOT USED
 # ─────────────────────────────────────────────────────────────
-
 def apply_bottom_hat(image, radius=15):
     """
     Applies a Morphological Bottom-Hat (Black Top-Hat) transform using a
@@ -611,7 +475,6 @@ def apply_bottom_hat(image, radius=15):
 
     # Bottom-Hat = Closing(Image) - Image
     return cv2.morphologyEx(image, cv2.MORPH_BLACKHAT, kernel)
-
 
 def browse_bottomhat_nlm_clahe_grid(series_dict, n=9, seed=42):
     """
@@ -670,7 +533,6 @@ def browse_bottomhat_nlm_clahe_grid(series_dict, n=9, seed=42):
                              style=slider_style, layout=slider_layout),
         continuous_update=False
     )
-
 
 def preprocess_bottomhat_nlm_clahe(img, radius=15, h=8, clip_limit=4.0):
     """

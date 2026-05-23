@@ -14,35 +14,6 @@ from src.preprocessing import preprocess_bs_nlm_clahe
 
 from skimage.measure import label
 
-
-def mantener_top_dos_esqueletos(skeleton_binary):
-    """
-    Analiza el esqueleto binario, cuenta los píxeles de cada ramificación
-    aislada y elimina todo excepto las 2 más grandes.
-    """
-    # 1. Etiquetar cada grupo de píxeles conectados con un ID único
-    labeled_mask, num_features = label(skeleton_binary, return_num=True)
-
-    # Si la imagen ya tiene 2 o menos componentes, no hace falta filtrar
-    if num_features <= 2:
-        return skeleton_binary
-
-    # 2. Contar el número de píxeles (tamaño) de cada ID
-    pixel_counts = np.bincount(labeled_mask.ravel())
-
-    # Forzamos a que el fondo (ID = 0) no cuente como el "esqueleto más grande"
-    pixel_counts[0] = 0
-
-    # 3. Obtener los índices (IDs) de las 2 componentes con más píxeles
-    # argsort ordena de menor a mayor, [-2:] coge los dos últimos
-    indices_top_2 = np.argsort(pixel_counts)[-2:]
-
-    # 4. Crear la máscara final conservando solo esos dos IDs
-    skeleton_filtrado = np.isin(labeled_mask, indices_top_2)
-
-    return skeleton_filtrado.astype(np.uint8)
-
-
 # ─────────────────────────────────────────────────────────────
 # Shared patient sampler (mirrors preprocessing.py)
 # ─────────────────────────────────────────────────────────────
@@ -322,9 +293,6 @@ def browse_hysteresis_grid(series_dict,
         continuous_update=False
     )
 
-# ─────────────────────────────────────────────────────────────
-# Clea small objects after hysteresis thresholding
-# ─────────────────────────────────────────────────────────────
 # ─────────────────────────────────────────────────────────────
 # Clean Hysteresis with Area Filtering
 # ─────────────────────────────────────────────────────────────
