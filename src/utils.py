@@ -7,7 +7,10 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
-from src.config import RAW_IMG_DIR
+from src.config import (
+    RAW_IMG_DIR,
+    PREPROCESSED_IMG_DIR
+)
 
 def get_all_image_paths(directory=RAW_IMG_DIR):
     """
@@ -278,3 +281,42 @@ def save_single(series_dict, output_dir, pipeline_fn, positions, seed=42, dpi=30
         fig.savefig(out_path, dpi=dpi, bbox_inches='tight')
         plt.close(fig)
         print(f"  Saved → {out_path}")
+
+
+def get_processed_image_paths(
+        directory=PREPROCESSED_IMG_DIR
+):
+    """
+    Returns ONLY *_processed.png images
+    from dataset_preprocessed.
+    """
+
+    pattern = os.path.join(
+        directory,
+        "**",
+        "*_processed.png"
+    )
+
+    found = glob.glob(
+        pattern,
+        recursive=True
+    )
+
+    clean_list = sorted(list(set(found)))
+
+    return clean_list
+
+def get_skeleton_path(processed_path):
+
+    return processed_path.replace(
+        "_processed.png",
+        "_skeleton.png"
+    )
+
+
+def get_bbox_xml_path(processed_path):
+
+    return processed_path.replace(
+        "_processed.png",
+        "_bbox.xml"
+    )

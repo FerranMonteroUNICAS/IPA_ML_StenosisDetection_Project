@@ -4,6 +4,9 @@ import os
 # This automatically finds the base directory of your project relative to this file
 ROOT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+PREPROCESSED_IMG_DIR = os.path.join(ROOT_DIR, "dataset_processed")
+
+
 # --- Data Paths ---
 # Based on your file explorer, your images are in 'dataset'
 RAW_IMG_DIR = os.path.join(ROOT_DIR, "dataset_subtracted")
