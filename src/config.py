@@ -11,6 +11,8 @@ PREPROCESSED_IMG_DIR = os.path.join(ROOT_DIR, "dataset_processed")
 # Based on your file explorer, your images are in 'dataset'
 RAW_IMG_DIR = os.path.join(ROOT_DIR, "dataset_subtracted")
 
+PROCESSED_IMG_DIR = os.path.join(ROOT_DIR, "dataset_processed")
+
 CLAHE_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/clahe")
 
 NLMEANS_IMG_DIR = os.path.join(ROOT_DIR, "preprocessing/nlmeans")

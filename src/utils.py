@@ -7,10 +7,8 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
-from src.config import (
-    RAW_IMG_DIR,
-    PREPROCESSED_IMG_DIR
-)
+from src.config import RAW_IMG_DIR
+from src.config import PROCESSED_IMG_DIR
 
 def get_all_image_paths(directory=RAW_IMG_DIR):
     """
@@ -25,6 +23,29 @@ def get_all_image_paths(directory=RAW_IMG_DIR):
     clean_list = list(set(p for p in found if p.lower().endswith(('.bmp', '.png'))))
     print(f"Total images found: {len(clean_list)}")
     return sorted(clean_list)
+
+def seprate_processed_files(all_image_paths):
+    """
+    Function used to obtain masks, skeletons and processed images separately after processing.
+    :param all_image_paths: paths of all the .png files in the processed folder. They can be obtained using get_all_image_paths().
+    :return: 3 lists of paths, one for eah type of processing pipeline output.
+    """
+    processed_images_paths = []
+    masks_paths = []
+    skeletons_paths = []
+    for path in all_image_paths:
+        try:
+            if path.endswith('processed.png'):
+                processed_images_paths.append(path)
+            elif path.endswith('mask.png'):
+                masks_paths.append(path)
+            elif path.endswith('skeleton.png'):
+                skeletons_paths.append(path)
+        except:
+            print(f"Warning: Could not classify file {path}")
+    print(f"Processed images: {len(processed_images_paths)}, Masks: {len(masks_paths)}, Skeletons: {len(skeletons_paths)}")
+    separated_paths = [processed_images_paths, masks_paths, skeletons_paths]
+    return  separated_paths
 
 
 def load_image(path):
