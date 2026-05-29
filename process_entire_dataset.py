@@ -41,7 +41,7 @@ if ROOT_DIR not in sys.path:
     sys.path.append(ROOT_DIR)
 try:
     from src.preprocessing import preprocess_bs_nlm_clahe
-    from src.vessel_segmentation_ferran import apply_frangi, apply_cleaned_hysteresis
+    from src.vessel_segmentation import apply_frangi, apply_cleaned_hysteresis
 except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import core functions from 'src': {e}")
     sys.exit(1)

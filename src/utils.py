@@ -7,6 +7,8 @@ import numpy as np
 import xml.etree.ElementTree as ET
 from collections import defaultdict
 from pathlib import Path
+from src.config import RAW_IMG_DIR
+from src.config import PROCESSED_IMG_DIR
 from src.config import RAW_IMG_DIR, PREPROCESSED_IMG_DIR, PROCESSED_IMG_DIR
 
 def get_all_image_paths(directory=RAW_IMG_DIR):

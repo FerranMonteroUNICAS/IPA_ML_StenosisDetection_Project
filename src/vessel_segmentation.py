@@ -1,464 +1,380 @@
-import os
-import json
-import random
-import warnings
-from pathlib import Path
-
 import numpy as np
 import cv2
-from ipywidgets import IntSlider, FloatSlider, interact, Dropdown
-from matplotlib import pyplot as plt
-from skimage import filters, morphology
-from skimage.filters import frangi
+import matplotlib.pyplot as plt
+import random
+from collections import defaultdict
+from pathlib import Path
+from ipywidgets import interact, FloatSlider, IntSlider, Dropdown
+from skimage.filters import frangi, sato, meijering, apply_hysteresis_threshold
+from skimage.morphology import remove_small_objects
+
 from src.utils import load_image
+from src.preprocessing import preprocess_bs_nlm_clahe
 
 
-# import pandas as pd
-# from tqdm import tqdm
+from skimage.measure import label
 
-
-# ─────────────────────────────────────────────
-# STAGE 3 — Vesselness (Frangi)
-# ─────────────────────────────────────────────
-
-def frangi_vesselness(preprocessed: np.ndarray,
-                      sigma_min: float = 1.0,
-                      sigma_max: float = 10.0,
-                      sigma_steps: int = 6,
-                      beta: float = 0.5,
-                      gamma: float = 15.0) -> np.ndarray:
+# ─────────────────────────────────────────────────────────────
+# Shared patient sampler (mirrors preprocessing.py)
+# ─────────────────────────────────────────────────────────────
+def _sample_patient_frames(series_dict, n=9, seed=42):
     """
-    Apply Frangi vesselness filter to a single preprocessed float32 frame.
-
-    IMPORTANT: angiography vessels are DARK → invert before Frangi,
-    then use black_ridges=False (skimage ≥ 0.19) which detects bright ridges
-    on the inverted image == dark vessels on the original.
-
-    Returns a float64 vesselness map in [0, 1].
+    Selects one middle frame per patient, samples n patients randomly.
+    Returns list of (patient_id, loaded_image) tuples.
     """
-    # Invert: dark vessels → bright ridges
-    inverted = 1.0 - preprocessed
+    rng = random.Random(seed)
 
-    sigmas = np.linspace(sigma_min, sigma_max, sigma_steps)
+    patients = defaultdict(list)
+    for key, frame_paths in series_dict.items():
+        patient_id = key.split("/")[0]
+        mid = frame_paths[len(frame_paths) // 2]
+        patients[patient_id].append(mid)
 
-    vessel_map = frangi(inverted,
-                        sigmas=sigmas,
-                        beta=beta,
-                        gamma=gamma,
-                        black_ridges=False)   # bright ridges on inverted img
+    patient_ids = sorted(patients.keys())
+    selected    = rng.sample(patient_ids, min(n, len(patient_ids)))
 
-    # Normalise to [0, 1] for display / thresholding
-    v_min, v_max = vessel_map.min(), vessel_map.max()
-    if v_max > v_min:
-        vessel_map = (vessel_map - v_min) / (v_max - v_min)
+    loaded = []
+    for pid in selected:
+        path = rng.choice(patients[pid])
+        img  = load_image(path)
+        if img is not None:
+            loaded.append((pid, img))
 
-    return vessel_map
+    return loaded
 
+# ─────────────────────────────────────────────────────────────
+# Ridge filters
+# ─────────────────────────────────────────────────────────────
+def apply_frangi(image, scale_min=1, scale_max=5, scale_step=1,
+                 alpha=0.5, beta=0.5, black_ridges=True):
+    """
+    Frangi vesselness filter — detects tubular structures by analysing
+    the eigenvalues of the Hessian matrix at multiple scales.
 
-# ─────────────────────────────────────────────
-# INTERACTIVE EXPLORER  (Jupyter / ipywidgets)
-# ─────────────────────────────────────────────
+    Parameters:
+        image      : grayscale uint8 numpy array
+        scale_min  : minimum vessel width scale in pixels (default 1)
+        scale_max  : maximum vessel width scale in pixels (default 5)
+        scale_step : step between scales (default 1)
+        alpha      : sensitivity to plate-like structures (default 0.5)
+        beta       : sensitivity to blob-like structures (default 0.5)
+        black_ridges: True for dark vessels on bright background (default True)
 
-# def browse_frangi_interactive(series_dict, title="Frangi explorer"):
-#     """
-#     Single interactive widget that lets you switch between series
-#     via a dropdown — avoids the broken for-loop pattern.
-#     """
-#     # Pre-cache all series
-#     print("Loading preprocessed frames…")
-#     cache = {
-#         key: [load_image(p) for p in paths]
-#         for key, paths in series_dict.items()
-#     }
-#     print("Done. Use sliders to explore Frangi parameters.")
-#
-#     def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma):
-#         try:
-#             frames = cache[serie_key]
-#             frame_idx = min(frame_idx, len(frames) - 1)
-#             pre = frames[frame_idx]
-#             if pre.dtype == np.uint8:
-#                 pre = pre.astype(np.float32) / 255.0
-#
-#             # Debug: confirm what load_image returned
-#             print(f"pre type: {type(pre)}, dtype: {getattr(pre, 'dtype', 'N/A')}, shape: {getattr(pre, 'shape', 'N/A')}")
-#
-#             if pre is None:
-#                 print("❌ load_image returned None — check your path/loader")
-#                 return
-#             fname = Path(list(series_dict[serie_key])[frame_idx]).name
-#
-#             if sigma_min >= sigma_max:
-#                 sigma_max = sigma_min + 0.5
-#
-#             vessel = frangi_vesselness(pre,
-#                                        sigma_min=sigma_min,
-#                                        sigma_max=sigma_max,
-#                                        sigma_steps=int(sigma_steps),
-#                                        beta=beta,
-#                                        gamma=gamma)
-#         except Exception as e:
-#             import traceback
-#             print(f"❌ Error in update(): {e}")
-#             traceback.print_exc()
-#
-#         from skimage.filters import threshold_otsu
-#         otsu_val = threshold_otsu(vessel)
-#         p95 = np.percentile(vessel, 95)
-#         p99 = np.percentile(vessel, 99)
-#
-#         fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-#         fig.suptitle(
-#             f"{serie_key}  |  {fname}\n"
-#             f"σ=[{sigma_min:.1f}–{sigma_max:.1f}, {int(sigma_steps)} steps]  "
-#             f"β={beta:.2f}  γ={gamma:.1f}",
-#             fontsize=11,
-#         )
-#
-#         axes[0].imshow(pre, cmap="gray")
-#         axes[0].set_title("① Preprocessed (CLAHE + NLM)")
-#         axes[0].axis("off")
-#
-#         axes[1].imshow(vessel, cmap="hot")
-#         axes[1].set_title("② Vesselness map (Frangi)")
-#         axes[1].axis("off")
-#         sm = plt.cm.ScalarMappable(cmap="hot", norm=plt.Normalize(vmin=0, vmax=1))
-#         plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
-#
-#         axes[2].hist(vessel.ravel(), bins=256, color="steelblue", log=True)
-#         axes[2].set_title("③ Vesselness histogram (log scale)")
-#         axes[2].set_xlabel("Vesselness value")
-#         axes[2].set_ylabel("Pixel count (log)")
-#         axes[2].axvline(otsu_val, color="red", linestyle="--",
-#                         label=f"Otsu = {otsu_val:.3f}")
-#         axes[2].axvline(p95, color="orange", linestyle="--",
-#                         label=f"p95  = {p95:.3f}")
-#         axes[2].axvline(p99, color="green", linestyle="--",
-#                         label=f"p99  = {p99:.3f}")
-#         axes[2].legend(fontsize=8)
-#
-#         plt.tight_layout()
-#         plt.show()
-#
-#     # Max frames across all series for the slider upper bound
-#     max_frames = max(len(v) for v in series_dict.values())
-#
-#     serie_dropdown = Dropdown(options=list(series_dict.keys()),
-#                               description="Serie")
-#     frame_slider = IntSlider(min=0, max=max_frames - 1, step=1,
-#                              value=0, description="Frame")
-#     sigma_min_slider = FloatSlider(min=0.5, max=5.0, step=0.5, value=1.0, description="σ min")
-#     sigma_max_slider = FloatSlider(min=2.0, max=20.0, step=0.5, value=10.0, description="σ max")
-#     sigma_steps_slider = IntSlider(min=2, max=20, step=1, value=6, description="σ steps")
-#     beta_slider = FloatSlider(min=0.1, max=2.0, step=0.05, value=0.5, description="beta (β)")
-#     gamma_slider = FloatSlider(min=1.0, max=50.0, step=0.5, value=15.0, description="gamma (γ)")
-#
-#     interact(
-#         update,
-#         serie_key=serie_dropdown,
-#         frame_idx=frame_slider,
-#         sigma_min=sigma_min_slider,
-#         sigma_max=sigma_max_slider,
-#         sigma_steps=sigma_steps_slider,
-#         beta=beta_slider,
-#         gamma=gamma_slider,
-#         continuous_update=False
-#     )
+    Returns:
+        Vesselness map as float32 numpy array in [0, 1]
+    """
+    sigmas = np.arange(scale_min, scale_max + scale_step, scale_step)
+    result = frangi(image.astype(np.float32) / 255.0,
+                    sigmas=sigmas,
+                    alpha=alpha,
+                    beta=beta,
+                    black_ridges=black_ridges)
+    return result.astype(np.float32)
 
-def browse_frangi_interactive(series_dict, title="Frangi explorer"):
-    print("Loading preprocessed frames…")
-    cache = {
-        key: [load_image(p) for p in paths]
-        for key, paths in series_dict.items()
-    }
-    print("Done. Use sliders to explore Frangi parameters.")
+def apply_sato(image, scale_min=1, scale_max=5, scale_step=1, black_ridges=True):
+    """
+    Sato tubeness filter — uses only the largest Hessian eigenvalue,
+    making it more robust to noise than Frangi at the cost of some specificity.
 
-    _frangi_cache = {}  # ← CAMBIO 1: cache
+    Parameters:
+        image      : grayscale uint8 numpy array
+        scale_min  : minimum vessel width scale in pixels (default 1)
+        scale_max  : maximum vessel width scale in pixels (default 5)
+        scale_step : step between scales (default 1)
+        black_ridges: True for dark vessels on bright background (default True)
 
-    def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma):
-        frames = cache[serie_key]
-        frame_idx = min(frame_idx, len(frames) - 1)
-        pre = frames[frame_idx]
-        if pre.dtype == np.uint8:
-            pre = pre.astype(np.float32) / 255.0
-        fname = Path(list(series_dict[serie_key])[frame_idx]).name
+    Returns:
+        Tubeness map as float32 numpy array in [0, 1]
+    """
+    sigmas = np.arange(scale_min, scale_max + scale_step, scale_step)
+    result = sato(image.astype(np.float32) / 255.0,
+                  sigmas=sigmas,
+                  black_ridges=black_ridges)
+    # Normalise to [0, 1]
+    r_max = result.max()
+    return (result / r_max).astype(np.float32) if r_max > 0 else result.astype(np.float32)
 
-        if sigma_min >= sigma_max:
-            sigma_max = sigma_min + 0.5
+def apply_meijering(image, scale_min=1, scale_max=5, scale_step=1, black_ridges=True):
+    """
+    Meijering neuriteness filter — variant of Frangi optimised for thin,
+    elongated structures. Often better than Frangi for very fine vessels.
 
-        # ← CAMBIO 1: usar cache
-        fkey = (serie_key, frame_idx, sigma_min, sigma_max, int(sigma_steps), beta, gamma)
-        if fkey not in _frangi_cache:
-            _frangi_cache[fkey] = frangi_vesselness(pre,
-                                                     sigma_min=sigma_min,
-                                                     sigma_max=sigma_max,
-                                                     sigma_steps=int(sigma_steps),
-                                                     beta=beta,
-                                                     gamma=gamma)
-        vessel = _frangi_cache[fkey]
+    Parameters:
+        image      : grayscale uint8 numpy array
+        scale_min  : minimum vessel width scale in pixels (default 1)
+        scale_max  : maximum vessel width scale in pixels (default 5)
+        scale_step : step between scales (default 1)
+        black_ridges: True for dark vessels on bright background (default True)
 
-        # ← CAMBIO 2: quitado threshold_otsu (no se usa en el plot)
-        p95 = np.percentile(vessel, 95)
-        p99 = np.percentile(vessel, 99)
+    Returns:
+        Neuriteness map as float32 numpy array in [0, 1]
+    """
+    sigmas = np.arange(scale_min, scale_max + scale_step, scale_step)
+    result = meijering(image.astype(np.float32) / 255.0,
+                       sigmas=sigmas,
+                       black_ridges=black_ridges)
+    r_max = result.max()
+    return (result / r_max).astype(np.float32) if r_max > 0 else result.astype(np.float32)
 
-        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-        fig.suptitle(
-            f"{serie_key}  |  {fname}\n"
-            f"σ=[{sigma_min:.1f}–{sigma_max:.1f}, {int(sigma_steps)} steps]  "
-            f"β={beta:.2f}  γ={gamma:.1f}",
-            fontsize=11,
+# ─────────────────────────────────────────────────────────────
+# Filter dispatcher
+# ─────────────────────────────────────────────────────────────
+FILTER_MAP = {
+    "frangi": apply_frangi,
+    "sato": apply_sato,
+    "meijering": apply_meijering,
+}
+
+# ─────────────────────────────────────────────────────────────
+# Interactive grid
+# ─────────────────────────────────────────────────────────────
+def browse_ridge_grid(series_dict,
+                      kernel_size=41, h=10, clip_limit=2.0,
+                      n=9, seed=42):
+    """
+    Interactive 3×3 grid for exploring ridge filters on preprocessed images.
+
+    Preprocessing (BG sub → NLM → CLAHE) is fixed at load time using the
+    provided parameters. Only the filter type and scale range are interactive.
+
+    Sliders / dropdowns:
+        - Filter     : choose between frangi, sato, meijering
+        - Scale min  : smallest vessel width searched (pixels)
+        - Scale max  : largest vessel width searched (pixels)
+        - black_ridges: toggle for dark vs bright vessels
+
+    Parameters:
+        series_dict : output of group_paths_by_serie
+        kernel_size : BG subtraction kernel (fixed, set manually)
+        h           : NLM filter strength (fixed, set manually)
+        clip_limit  : CLAHE clip limit (fixed, set manually)
+        n           : number of patients in the grid (default 9)
+        seed        : random seed — use same as other browse functions
+    """
+    # Preprocess once — filter changes are the only variable
+    raw     = _sample_patient_frames(series_dict, n=n, seed=seed)
+    loaded  = [(pid, preprocess_bs_nlm_clahe(img,
+                                              kernel_size=kernel_size,
+                                              h=h,
+                                              clip_limit=clip_limit))
+               for pid, img in raw]
+
+    def update(filter_type, scale_min, scale_max, black_ridges):
+        if scale_min >= scale_max:
+            print("scale_min must be less than scale_max")
+            return
+
+        filter_fn = FILTER_MAP[filter_type]
+        rows = int(np.ceil(len(loaded) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
+
+        for i, (pid, proc) in enumerate(loaded):
+            result = filter_fn(proc,
+                               scale_min=scale_min,
+                               scale_max=scale_max,
+                               black_ridges=black_ridges)
+            axes[i].imshow(result, cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
+
+        for j in range(len(loaded), len(axes)):
+            axes[j].axis('off')
+
+        plt.suptitle(
+            f"{filter_type.capitalize()}  |  scales {scale_min}–{scale_max}  |  "
+            f"black_ridges={black_ridges}  |  "
+            f"preproc: k={kernel_size}, h={h}, clip={clip_limit}",
+            fontsize=10, y=1.01
         )
-
-        axes[0].imshow(pre, cmap="gray")
-        axes[0].set_title("① Preprocessed (CLAHE + NLM)")
-        axes[0].axis("off")
-
-        axes[1].imshow(vessel, cmap="gray")
-        axes[1].set_title("② Vesselness map (Frangi)")
-        axes[1].axis("off")
-        sm = plt.cm.ScalarMappable(cmap="gray", norm=plt.Normalize(vmin=0, vmax=1))
-        plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
-
-        axes[2].hist(vessel.ravel(), bins=256, color="steelblue", log=True)
-        axes[2].set_title("③ Vesselness histogram (log scale)")
-        axes[2].set_xlabel("Vesselness value")
-        axes[2].set_ylabel("Pixel count (log)")
-        axes[2].axvline(p95, color="orange", linestyle="--", label=f"p95 = {p95:.3f}")
-        axes[2].axvline(p99, color="green",  linestyle="--", label=f"p99 = {p99:.3f}")
-        axes[2].legend(fontsize=8)
-
         plt.tight_layout()
         plt.show()
 
-    max_frames = max(len(v) for v in series_dict.values())
+    slider_style  = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
 
     interact(
         update,
-        serie_key=Dropdown(options=list(series_dict.keys()), description="Serie"),
-        frame_idx=IntSlider(min=0, max=max_frames - 1, step=1, value=0, description="Frame"),
-        sigma_min=FloatSlider(min=0.5, max=5.0,  step=0.5, value=1.0, description="σ min"),
-        sigma_max=FloatSlider(min=2.0, max=20.0, step=0.5, value=10.0, description="σ max"),
-        sigma_steps=IntSlider(min=2,   max=20,   step=1,   value=6,    description="σ steps"),
-        beta=FloatSlider(min=0.1,  max=2.0,  step=0.05, value=0.5,  description="beta (β)"),
-        gamma=FloatSlider(min=1.0, max=50.0, step=0.5,  value=15.0, description="gamma (γ)"),
+        filter_type=Dropdown(
+            options=["frangi", "sato", "meijering"],
+            value="frangi",
+            description="Filter",
+            style=slider_style,
+            layout=slider_layout
+        ),
+        scale_min=IntSlider(min=1, max=10, step=1, value=4,
+                            description='Scale min (px)',
+                            style=slider_style, layout=slider_layout),
+        scale_max=IntSlider(min=2, max=30, step=1, value=15,
+                            description='Scale max (px)',
+                            style=slider_style, layout=slider_layout),
+        black_ridges=Dropdown(
+            options=[True, False],
+            value=True,
+            description='Black ridges',
+            style=slider_style,
+            layout=slider_layout
+        ),
         continuous_update=False
     )
 
-def browse_frangi_interactive2(series_dict, title="Frangi explorer"):
+# ─────────────────────────────────────────────────────────────
+# Hysteresis Thresholding & Visualization
+# ─────────────────────────────────────────────────────────────
+
+def apply_hysteresis(frangi_image, low_thresh=0.05, high_thresh=0.25):
     """
-    series_dict: {serie_key: [np.ndarray, ...]}  ← already loaded frames
+    Applies a dual-threshold hysteresis operation to binarize the vesselness map.
+    Pixels above high_thresh are certain vessels. Connected pixels above low_thresh
+    are preserved to bridge gaps.
     """
-    print("Frames already loaded. Use sliders to explore Frangi parameters.")
+    mask = apply_hysteresis_threshold(frangi_image, low=low_thresh, high=high_thresh)
+    return mask
 
-    # No load_image needed — frames are already numpy arrays
-    cache = series_dict  # ← direct reference, no loading
+def browse_hysteresis_grid(series_dict,
+                           kernel_size=81, h=8, clip_limit=4.0,
+                           scale_min=4, scale_max=15,
+                           n=9, seed=42):
+    """
+    Interactive 3×3 grid for tuning Hysteresis thresholds on a 9-patient panel.
+    Precomputes the preprocessing and Frangi stages once for smooth widget response.
+    """
+    print("Precomputing Frangi outputs for the grid panel... please wait.")
+    raw = _sample_patient_frames(series_dict, n=n, seed=seed)
 
-    _frangi_cache = {}
+    # Precompute up to the Frangi filter step so slider updates are instantaneous
+    loaded_frangi = []
+    for pid, img in raw:
+        proc = preprocess_bs_nlm_clahe(img, kernel_size=kernel_size, h=h, clip_limit=clip_limit)
+        frangi_map = apply_frangi(proc, scale_min=scale_min, scale_max=scale_max, black_ridges=True)
+        loaded_frangi.append((pid, frangi_map))
 
-    def update(serie_key, frame_idx, sigma_min, sigma_max, sigma_steps, beta, gamma, black_ridges=True):
-        frames = cache[serie_key]
-        frame_idx = min(frame_idx, len(frames) - 1)
-        pre = frames[frame_idx]
+    print("Precomputation finished! Loading grid...")
 
-        if pre.dtype == np.uint8:
-            pre = pre.astype(np.float32) / 255.0
+    def update(low_thresh, high_thresh):
+        if low_thresh >= high_thresh:
+            print("⚠️ Error: Low threshold must be strictly less than High threshold.")
+            return
 
-        # No path available, use index as label
-        fname = f"frame_{frame_idx:03d}"
+        rows = int(np.ceil(len(loaded_frangi) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
 
-        if sigma_min >= sigma_max:
-            sigma_max = sigma_min + 0.5
+        for i, (pid, frangi_img) in enumerate(loaded_frangi):
+            binary_mask = apply_hysteresis(frangi_img, low_thresh=low_thresh, high_thresh=high_thresh)
 
-        fkey = (serie_key, frame_idx, sigma_min, sigma_max, int(sigma_steps), beta, gamma)
-        if fkey not in _frangi_cache:
-            _frangi_cache[fkey] = frangi_vesselness(
-                pre,
-                sigma_min=sigma_min,
-                sigma_max=sigma_max,
-                sigma_steps=int(sigma_steps),
-                beta=beta,
-                gamma=gamma,
-            )
-        vessel = _frangi_cache[fkey]
+            # Displaying as binary (black and white)
+            axes[i].imshow(binary_mask, cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
 
-        p95 = np.percentile(vessel, 95)
-        p99 = np.percentile(vessel, 99)
+        for j in range(len(loaded_frangi), len(axes)):
+            axes[j].axis('off')
 
-        fig, axes = plt.subplots(1, 3, figsize=(20, 7))
-        fig.suptitle(
-            f"{serie_key}  |  {fname}\n"
-            f"σ=[{sigma_min:.1f}–{sigma_max:.1f}, {int(sigma_steps)} steps]  "
-            f"β={beta:.2f}  γ={gamma:.1f}",
-            fontsize=11,
+        plt.suptitle(
+            f"Hysteresis Mask  |  Low={low_thresh:.2f}, High={high_thresh:.2f}\n"
+            f"Fixed Frangi scales: {scale_min}–{scale_max} px",
+            fontsize=11, y=1.02
         )
-
-        axes[0].imshow(pre, cmap="gray")
-        axes[0].set_title("① Preprocessed (CLAHE + NLM)")
-        axes[0].axis("off")
-
-        axes[1].imshow(vessel, cmap="gray")
-        axes[1].set_title("② Vesselness map (Frangi)")
-        axes[1].axis("off")
-        sm = plt.cm.ScalarMappable(cmap="gray", norm=plt.Normalize(vmin=0, vmax=1))
-        plt.colorbar(sm, ax=axes[1], fraction=0.046, pad=0.04)
-
-        axes[2].hist(vessel.ravel(), bins=256, color="steelblue", log=True)
-        axes[2].set_title("③ Vesselness histogram (log scale)")
-        axes[2].set_xlabel("Vesselness value")
-        axes[2].set_ylabel("Pixel count (log)")
-        axes[2].axvline(p95, color="orange", linestyle="--", label=f"p95 = {p95:.3f}")
-        axes[2].axvline(p99, color="green",  linestyle="--", label=f"p99 = {p99:.3f}")
-        axes[2].legend(fontsize=8)
-
         plt.tight_layout()
         plt.show()
 
-    max_frames = max(len(v) for v in series_dict.values())
+    slider_style = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
 
     interact(
         update,
-        serie_key=Dropdown(options=list(series_dict.keys()), description="Serie"),
-        frame_idx=IntSlider(min=0, max=max_frames - 1, step=1, value=0, description="Frame"),
-        sigma_min=FloatSlider(min=0.5, max=5.0,  step=0.5, value=1.0,  description="σ min"),
-        sigma_max=FloatSlider(min=2.0, max=20.0, step=0.5, value=10.0, description="σ max"),
-        sigma_steps=IntSlider(min=2,   max=20,   step=1,   value=6,    description="σ steps"),
-        beta=FloatSlider(min=0.1,  max=2.0,  step=0.05, value=0.5,  description="beta (β)"),
-        gamma=FloatSlider(min=1.0, max=50.0, step=0.5,  value=15.0, description="gamma (γ)"),
-        continuous_update=False,
+        high_thresh=FloatSlider(min=0.05, max=0.60, step=0.01, value=0.20,
+                                description='High Thresh (Seeds)',
+                                style=slider_style, layout=slider_layout),
+        low_thresh=FloatSlider(min=0.01, max=0.20, step=0.01, value=0.05,
+                               description='Low Thresh (Bridges)',
+                               style=slider_style, layout=slider_layout),
+        continuous_update=False
     )
 
-def binarize_vessels(vesselness: np.ndarray,
-                     method: str = "otsu") -> np.ndarray:
-    v_u8 = (vesselness * 255).astype(np.uint8)
+# ─────────────────────────────────────────────────────────────
+# Clean Hysteresis with Area Filtering
+# ─────────────────────────────────────────────────────────────
 
-    if method == "otsu":
-        _, binary = cv2.threshold(v_u8, 0, 255,
-                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    elif method == "local":
-        thresh = filters.threshold_sauvola(vesselness, window_size=25)
-        binary = (vesselness > thresh).astype(np.uint8) * 255
-    else:
-        raise ValueError(f"Unknown threshold method: {method}")
-
-    # morphological clean-up: remove tiny speckles
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=2)
-    return (binary > 0).astype(np.uint8)
-
-
-def skeletonise(binary_mask: np.ndarray) -> np.ndarray:
+def apply_cleaned_hysteresis(frangi_image, low_thresh=0.05, high_thresh=0.25, min_size=200):
     """
-    Medial-axis skeletonisation → single-pixel-wide centreline.
+    Applies hysteresis thresholding and automatically deletes any isolated
+    binary structures/blobs containing fewer than `min_size` pixels.
     """
-    skel = morphology.skeletonize(binary_mask.astype(bool))
-    return skel.astype(np.uint8)
+    # 1. Standard dual-threshold binarization
+    mask = apply_hysteresis_threshold(frangi_image, low=low_thresh, high=high_thresh)
+
+    # 2. Size filtering to eliminate background noise components
+    cleaned_mask = remove_small_objects(mask, min_size=min_size)
+
+    return cleaned_mask
 
 
-def load_annotations(annot_path: Path):
+def browse_clean_hysteresis_grid(series_dict,
+                                 kernel_size=81, h=8, clip_limit=4.0,
+                                 scale_min=4, scale_max=15,
+                                 n=9, seed=42):
     """
-    Load ground-truth bounding boxes from a JSON file.
-    Expected format: {"boxes": [[x, y, w, h], ...]}
-    Returns list of (x, y, w, h) tuples or [] if file missing.
+    Interactive 3×3 grid for tuning Hysteresis thresholds combined with
+    a connected component minimum size noise filter.
     """
-    if not annot_path.exists():
-        return []
-    with open(annot_path) as f:
-        data = json.load(f)
-    return [tuple(b) for b in data.get("boxes", [])]
+    print("Precomputing Frangi outputs for the grid panel... please wait.")
+    raw = _sample_patient_frames(series_dict, n=n, seed=seed)
 
+    loaded_frangi = []
+    for pid, img in raw:
+        proc = preprocess_bs_nlm_clahe(img, kernel_size=kernel_size, h=h, clip_limit=clip_limit)
+        frangi_map = apply_frangi(proc, scale_min=scale_min, scale_max=scale_max, black_ridges=True)
+        loaded_frangi.append((pid, frangi_map))
 
-def point_in_boxes(cx: int, cy: int, boxes) -> bool:
-    """Return True if (cx, cy) falls inside any bounding box."""
-    for (x, y, w, h) in boxes:
-        if x <= cx <= x + w and y <= cy <= y + h:
-            return True
-    return False
+    print("Precomputation finished! Loading grid...")
 
+    def update(low_thresh, high_thresh, min_size):
+        if low_thresh >= high_thresh:
+            print("⚠️ Error: Low threshold must be strictly less than High threshold.")
+            return
 
-def min_dist_to_boxes(cx: int, cy: int, boxes) -> float:
-    """Minimum distance from (cx, cy) to the nearest bounding box border."""
-    if not boxes:
-        return float("inf")
-    dists = []
-    for (x, y, w, h) in boxes:
-        # clamp point to box, measure distance
-        nx = np.clip(cx, x, x + w)
-        ny = np.clip(cy, y, y + h)
-        dists.append(np.hypot(cx - nx, cy - ny))
-    return min(dists)
+        rows = int(np.ceil(len(loaded_frangi) / 3))
+        fig, axes = plt.subplots(rows, 3, figsize=(3 * 3.5, rows * 3.5))
+        axes = axes.flatten()
 
+        for i, (pid, frangi_img) in enumerate(loaded_frangi):
+            # Apply our noise-filtering binarization pipeline
+            binary_mask = apply_cleaned_hysteresis(
+                frangi_img,
+                low_thresh=low_thresh,
+                high_thresh=high_thresh,
+                min_size=min_size
+            )
 
-def extract_patch(img: np.ndarray,
-                  cx: int, cy: int,
-                  size: int) -> np.ndarray | None:
-    """
-    Extract a square patch centred on (cx, cy).
-    Returns None if the patch would go out of bounds.
-    """
-    half = size // 2
-    h, w = img.shape[:2]
-    x0, x1 = cx - half, cx + half
-    y0, y1 = cy - half, cy + half
-    if x0 < 0 or y0 < 0 or x1 > w or y1 > h:
-        return None
-    return img[y0:y1, x0:x1].copy()
+            axes[i].imshow(binary_mask, cmap='gray')
+            axes[i].set_title(f"P{pid}", fontsize=8)
+            axes[i].axis('off')
 
-#
-# def extract_rois(preprocessed_img: np.ndarray,
-#                  skeleton: np.ndarray,
-#                  boxes,
-#                  patient: str,
-#                  session: str,
-#                  frame_stem: str,
-#                  metadata: list,
-#                  roi_size: int = ROI_SIZE):
-#     """
-#     Monte-Carlo sampling along the skeleton centreline.
-#     Positive ROIs  — centre inside a GT bounding box.
-#     Negative ROIs  — centre ≥ MIN_DIST_NEG px from every bbox.
-#     """
-#     ys, xs = np.where(skeleton > 0)
-#     n_pixels = len(xs)
-#     if n_pixels == 0:
-#         return
-#
-#     # sample a fraction of skeleton pixels
-#     n_sample = max(1, int(n_pixels * MONTECARLO_FRAC))
-#     indices = np.random.choice(n_pixels, size=n_sample, replace=False)
-#
-#     positives, negatives = [], []
-#
-#     for idx in indices:
-#         cx, cy = int(xs[idx]), int(ys[idx])
-#         patch = extract_patch(preprocessed_img, cx, cy, roi_size)
-#         if patch is None:
-#             continue
-#
-#         if point_in_boxes(cx, cy, boxes):
-#             positives.append((cx, cy, patch))
-#         elif min_dist_to_boxes(cx, cy, boxes) >= MIN_DIST_NEG:
-#             negatives.append((cx, cy, patch))
-#
-#     # ── class balancing: cap negatives ─────────────────────────────────────
-#     max_neg = max(1, int(len(positives) * MAX_NEG_RATIO))
-#     if len(negatives) > max_neg:
-#         negatives = random.sample(negatives, max_neg)
-#
-#     # ── save patches ────────────────────────────────────────────────────────
-#     base = f"{patient}_{session}_{frame_stem}"
-#
-#     for i, (cx, cy, patch) in enumerate(positives):
-#         fname = f"{base}_roi{i:04d}.png"
-#         cv2.imwrite(str(OUTPUT_DIR / "positive" / fname),
-#                     (patch * 255).astype(np.uint8))
-#         metadata.append(dict(label=1, patient=patient, session=session,
-#                              frame=frame_stem, cx=cx, cy=cy, file=fname))
-#
-#     n_pos = len(positives)
-#     for i, (cx, cy, patch) in enumerate(negatives):
-#         fname = f"{base}_roi{n_pos + i:04d}.png"
-#         cv2.imwrite(str(OUTPUT_DIR / "negative" / fname),
-#                     (patch * 255).astype(np.uint8))
-#         metadata.append(dict(label=0, patient=patient, session=session,
-#                              frame=frame_stem, cx=cx, cy=cy, file=fname))
+        for j in range(len(loaded_frangi), len(axes)):
+            axes[j].axis('off')
+
+        plt.suptitle(
+            f"Low={low_thresh:.2f}, High={high_thresh:.2f} | Noise Filter (min_size={min_size}px)",
+            fontsize=11, y=1.02
+        )
+        plt.tight_layout()
+        plt.show()
+
+    slider_style = {'description_width': 'initial'}
+    slider_layout = {'width': '450px'}
+
+    interact(
+        update,
+        high_thresh=FloatSlider(min=0.05, max=0.60, step=0.01, value=0.18,
+                                description='High Thresh (Seeds)',
+                                style=slider_style, layout=slider_layout),
+        low_thresh=FloatSlider(min=0.01, max=0.20, step=0.01, value=0.02,
+                               description='Low Thresh (Bridges)',
+                               style=slider_style, layout=slider_layout),
+        min_size=IntSlider(min=10, max=1000, step=20, value=200,
+                           description='Min Object Size (px)',
+                           style=slider_style, layout=slider_layout),
+        continuous_update=False
+    )
