@@ -1,0 +1,17 @@
+════════════════════════════════════════════════════
+  PIPELINE SENSITIVITY REPORT
+════════════════════════════════════════════════════
+  Total annotated images            : 8325
+  Images with ≥1 positive ROI       : 7980
+  Images with 0 positive ROIs       : 345
+  Sensitivity                       : 0.9586  (95.86%)
+────────────────────────────────────────────────────
+  Avg positive ROIs / image (all)   : 4.315
+  Avg positive ROIs / image (detected only): 4.502
+════════════════════════════════════════════════════
+
+Done in 2714.0s — 840826 ROIs extracted.
+df_coords shape : (840826, 7)
+Stenosis ROIs   : 44251
+Healthy ROIs    : 796575
+Class imbalance: 18 times more healthy than stenotic ROIs

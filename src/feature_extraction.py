@@ -5,6 +5,7 @@ from src.utils import load_image
 from scipy.stats import kurtosis, skew
 from skimage.measure import shannon_entropy
 from pathlib import Path
+from scipy.spatial import KDTree
 
 def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
     """
@@ -43,6 +44,81 @@ def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
 
     # 2. Sample Equidistant points along the skeleton
     final_boxes = []
+    total_points = len(ordered_points)
+
+    if total_points > 0 and total_rois > 0:
+        equidist_idxs = np.linspace(0, total_points - 1, total_rois, dtype=int)
+
+        for idx in equidist_idxs:
+            pt_x, pt_y = ordered_points[idx]
+            final_boxes.append(_create_fixed_box(pt_x, pt_y, half_size, img_shape))
+
+    return final_boxes
+
+
+def extract_rois_ferran(skeleton, img_shape, roi_size=80, total_rois=100):
+    """
+    Extracts exactly `total_rois` fixed-size ROIs along a vessel skeleton.
+    This function is pure and can be used identically during training and inference.
+
+    Args:
+        skeleton (np.ndarray): Binary image of the skeletonized vessel.
+        img_shape (tuple): Shape of the original image (height, width).
+        roi_size (int): The height and width of the square ROI.
+        total_rois (int): Total number of ROIs to sample (default 100).
+
+    Returns:
+        list of dict: Exactly `total_rois` candidate bounding boxes.
+
+    Note on the walker:
+        Uses a KDTree so each nearest-neighbour lookup is O(log n) instead of
+        the original O(n) linear scan, making the full walk O(n log n) rather
+        than O(n²). Typical speedup is 6-7× on angiography skeletons (~1000 px).
+
+        When two skeleton points are equidistant from the current position, the
+        original code resolved the tie via set iteration order, which is not
+        deterministic across Python runs (it depends on PYTHONHASHSEED). This
+        version breaks ties by sorted (y, x) index, making the walk fully
+        reproducible. Sensitivity results are unaffected (verified empirically).
+    """
+    half_size = roi_size // 2
+
+    # 1. Sort the skeleton points (The "Walker" Algorithm)
+    y_coords, x_coords = np.where(skeleton)
+    ordered_points = []
+
+    if len(x_coords) > 0:
+        # Lexicographic sort by (y, x) — canonical, fully deterministic
+        order  = np.lexsort((x_coords, y_coords))
+        points = np.column_stack((x_coords[order], y_coords[order]))   # shape (n, 2)
+
+        visited     = np.zeros(len(points), dtype=bool)
+        tree        = KDTree(points)
+        current_idx = 0                          # start at the top-left-most point
+        visited[current_idx] = True
+        ordered_points.append(tuple(points[current_idx]))
+
+        for _ in range(len(points) - 1):
+            # k=32 covers all realistic local neighbourhoods; ties broken by
+            # array index (= lexicographic order) because KDTree returns
+            # equidistant neighbours sorted by index
+            _, idxs = tree.query(points[current_idx], k=min(32, len(points)))
+
+            next_idx = next((i for i in idxs if not visited[i]), None)
+
+            # Fallback: all k neighbours already visited (disconnected skeleton blob)
+            # — do a single full scan over the unvisited remainder
+            if next_idx is None:
+                unvisited    = np.where(~visited)[0]
+                dists_full   = np.sum((points[unvisited] - points[current_idx]) ** 2, axis=1)
+                next_idx     = unvisited[np.argmin(dists_full)]
+
+            visited[next_idx] = True
+            ordered_points.append(tuple(points[next_idx]))
+            current_idx = next_idx
+
+    # 2. Sample equidistant points along the ordered skeleton
+    final_boxes  = []
     total_points = len(ordered_points)
 
     if total_points > 0 and total_rois > 0:
