@@ -5,7 +5,6 @@ from src.utils import load_image
 from scipy.stats import kurtosis, skew
 from skimage.measure import shannon_entropy
 from pathlib import Path
-from scipy.spatial import KDTree
 
 def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
     """
@@ -44,81 +43,6 @@ def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
 
     # 2. Sample Equidistant points along the skeleton
     final_boxes = []
-    total_points = len(ordered_points)
-
-    if total_points > 0 and total_rois > 0:
-        equidist_idxs = np.linspace(0, total_points - 1, total_rois, dtype=int)
-
-        for idx in equidist_idxs:
-            pt_x, pt_y = ordered_points[idx]
-            final_boxes.append(_create_fixed_box(pt_x, pt_y, half_size, img_shape))
-
-    return final_boxes
-
-
-def extract_rois_ferran(skeleton, img_shape, roi_size=80, total_rois=100):
-    """
-    Extracts exactly `total_rois` fixed-size ROIs along a vessel skeleton.
-    This function is pure and can be used identically during training and inference.
-
-    Args:
-        skeleton (np.ndarray): Binary image of the skeletonized vessel.
-        img_shape (tuple): Shape of the original image (height, width).
-        roi_size (int): The height and width of the square ROI.
-        total_rois (int): Total number of ROIs to sample (default 100).
-
-    Returns:
-        list of dict: Exactly `total_rois` candidate bounding boxes.
-
-    Note on the walker:
-        Uses a KDTree so each nearest-neighbour lookup is O(log n) instead of
-        the original O(n) linear scan, making the full walk O(n log n) rather
-        than O(n²). Typical speedup is 6-7× on angiography skeletons (~1000 px).
-
-        When two skeleton points are equidistant from the current position, the
-        original code resolved the tie via set iteration order, which is not
-        deterministic across Python runs (it depends on PYTHONHASHSEED). This
-        version breaks ties by sorted (y, x) index, making the walk fully
-        reproducible. Sensitivity results are unaffected (verified empirically).
-    """
-    half_size = roi_size // 2
-
-    # 1. Sort the skeleton points (The "Walker" Algorithm)
-    y_coords, x_coords = np.where(skeleton)
-    ordered_points = []
-
-    if len(x_coords) > 0:
-        # Lexicographic sort by (y, x) — canonical, fully deterministic
-        order  = np.lexsort((x_coords, y_coords))
-        points = np.column_stack((x_coords[order], y_coords[order]))   # shape (n, 2)
-
-        visited     = np.zeros(len(points), dtype=bool)
-        tree        = KDTree(points)
-        current_idx = 0                          # start at the top-left-most point
-        visited[current_idx] = True
-        ordered_points.append(tuple(points[current_idx]))
-
-        for _ in range(len(points) - 1):
-            # k=32 covers all realistic local neighbourhoods; ties broken by
-            # array index (= lexicographic order) because KDTree returns
-            # equidistant neighbours sorted by index
-            _, idxs = tree.query(points[current_idx], k=min(32, len(points)))
-
-            next_idx = next((i for i in idxs if not visited[i]), None)
-
-            # Fallback: all k neighbours already visited (disconnected skeleton blob)
-            # — do a single full scan over the unvisited remainder
-            if next_idx is None:
-                unvisited    = np.where(~visited)[0]
-                dists_full   = np.sum((points[unvisited] - points[current_idx]) ** 2, axis=1)
-                next_idx     = unvisited[np.argmin(dists_full)]
-
-            visited[next_idx] = True
-            ordered_points.append(tuple(points[next_idx]))
-            current_idx = next_idx
-
-    # 2. Sample equidistant points along the ordered skeleton
-    final_boxes  = []
     total_points = len(ordered_points)
 
     if total_points > 0 and total_rois > 0:
@@ -509,6 +433,102 @@ def plot_gabor_response_grid(roi, gabor_bank, title, n_orientations=12, n_sizes=
 
     plt.tight_layout()
     plt.show()
+
+def process_one_image_coords(args):
+    """
+    Top-level worker for ProcessPoolExecutor — picklable because it lives in
+    the module, not inside a notebook cell.
+
+    Args:
+        args : tuple of (img_path, mask_path, skel_path, gt_boxes, roi_size,
+                         half_size, labeling_threshold)
+
+    Returns:
+        list of dicts with ROI coordinate rows, or [] on failure.
+    """
+    import time
+    import traceback
+
+    img_path, mask_path, skel_path, gt_boxes, roi_size, half_size, labeling_threshold = args
+
+    try:
+        t_start = time.time()
+        print(f"[WORKER] ── START ── {img_path}", flush=True)
+
+        # ── Load images ───────────────────────────────────────────
+        img = load_image(img_path)
+        print(f"[WORKER]   img loaded      : {img is not None}"
+              f" | shape={img.shape if img is not None else 'N/A'}", flush=True)
+
+        skeleton = load_image(skel_path)
+        print(f"[WORKER]   skeleton loaded : {skeleton is not None}"
+              f" | shape={skeleton.shape if skeleton is not None else 'N/A'}", flush=True)
+
+        if img is None or skeleton is None:
+            print(f"[WORKER]   SKIP — None load for {img_path}", flush=True)
+            return []
+
+        # ── Image metadata ────────────────────────────────────────
+        img_shape  = img.shape[:2]
+        p          = Path(img_path)
+        patient_id = p.parts[-3]
+        serie_id   = p.parts[-2]
+        frame_stem = p.stem.replace('_processed', '')
+        image_name = f"{patient_id}_{serie_id}_{frame_stem}"
+
+        y_coords, x_coords = np.where(skeleton)
+        n_skel_pixels = len(x_coords)
+        print(f"[WORKER]   image_name     : {image_name}", flush=True)
+        print(f"[WORKER]   img_shape      : {img_shape}", flush=True)
+        print(f"[WORKER]   skeleton px    : {n_skel_pixels}", flush=True)
+
+        # ── extract_rois ──────────────────────────────────────────
+        print(f"[WORKER]   calling extract_rois ...", flush=True)
+        t0 = time.time()
+        sampled_boxes = extract_rois(skeleton, img_shape, roi_size=roi_size, total_rois=100)
+        print(f"[WORKER]   extract_rois done in {time.time()-t0:.2f}s"
+              f" — {len(sampled_boxes)} boxes", flush=True)
+
+        # ── label_rois ────────────────────────────────────────────
+        print(f"[WORKER]   calling label_rois (gt_boxes={len(gt_boxes)}) ...", flush=True)
+        t0 = time.time()
+        sampled_labels = label_rois(sampled_boxes, gt_boxes, threshold=labeling_threshold)
+        n_stenosis = sum(sampled_labels)
+        print(f"[WORKER]   label_rois done in {time.time()-t0:.2f}s"
+              f" — {n_stenosis} stenosis / {len(sampled_labels)-n_stenosis} healthy", flush=True)
+
+        # ── GT-centred boxes ──────────────────────────────────────
+        all_boxes_and_labels = list(zip(sampled_boxes, sampled_labels))
+        for gt_box in gt_boxes:
+            cx    = (gt_box['xmin'] + gt_box['xmax']) // 2
+            cy    = (gt_box['ymin'] + gt_box['ymax']) // 2
+            fixed = _create_fixed_box(cx, cy, half_size, img_shape)
+            all_boxes_and_labels.append((fixed, 1))
+        print(f"[WORKER]   total boxes     : {len(all_boxes_and_labels)}"
+              f" (100 sampled + {len(gt_boxes)} GT-centred)", flush=True)
+
+        # ── Build rows ────────────────────────────────────────────
+        rows = []
+        for roi_idx, (box, lbl) in enumerate(all_boxes_and_labels, start=1):
+            rows.append({
+                'roi_name'   : f"{image_name}_{roi_idx}",
+                'image_name' : image_name,
+                'xmin'       : box['xmin'],
+                'ymin'       : box['ymin'],
+                'xmax'       : box['xmax'],
+                'ymax'       : box['ymax'],
+                'label'      : lbl,
+            })
+
+        print(f"[WORKER]   rows built      : {len(rows)}", flush=True)
+        print(f"[WORKER] ── DONE  {image_name} in {time.time()-t_start:.2f}s ──", flush=True)
+        return rows
+
+    except Exception:
+        print(f"[WORKER ERROR] Exception processing {img_path}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return []
+
 
 def _extract_features_for_image(args, roi_size, half_size, labeling_threshold, gabor_bank, feature_cols):
     """
