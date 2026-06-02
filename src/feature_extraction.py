@@ -793,3 +793,89 @@ def extract_new_features(roi, mask_roi=None):
     features.extend(_extract_morphology_features(mask_binary))  # 12
                                                     # Total: 46
     return features
+
+
+def build_new_feature_column_names():
+    """
+    Generates ordered column names matching the 46 features
+    extracted by extract_new_features().
+    """
+    STAT_NAMES = ['mean', 'var', 'entropy', 'energy', 'kurtosis', 'skewness']
+    GLCM_PROPS = ['contrast', 'correlation', 'energy', 'homogeneity']
+    GLCM_ANGLES = ['0', '45', '90', '135']
+    RADON_STATS = ['mean', 'std', 'var']
+    MORPH_PROPS = ['area', 'perimeter', 'major_axis_length', 'minor_axis_length',
+                   'eccentricity', 'orientation', 'convex_area', 'filled_area',
+                   'solidity', 'extent', 'equiv_diameter', 'euler_number']
+
+    cols = []
+    # 1. First order statistics (6)
+    for stat in STAT_NAMES:
+        cols.append(f"new_firstorder_{stat}")
+
+    # 2. GLCM Features (16)
+    for prop in GLCM_PROPS:
+        for angle in GLCM_ANGLES:
+            cols.append(f"new_glcm_{prop}_{angle}deg")
+
+    # 3. Radon Transform Features (12)
+    for stat in RADON_STATS:
+        for angle in GLCM_ANGLES:
+            cols.append(f"new_radon_{stat}_{angle}deg")
+
+    # 4. Morphology Features (12)
+    for prop in MORPH_PROPS:
+        cols.append(f"new_morph_{prop}")
+
+    return cols
+
+
+def _extract_new_features_for_image_rois(image_group, roi_size=80):
+    """
+    Worker function for parallel processing. Processes all pre-extracted ROIs
+    belonging to a single image frame using coordinates from the CSV.
+
+    Parameters:
+        image_group : tuple of (image_name, dataframe_rows, image_paths_dict)
+                      where image_paths_dict has keys: 'img', 'mask'
+        roi_size    : int, target size validation (default 80)
+    Returns:
+        list of dict: New feature records for this image frame's ROIs.
+    """
+    image_name, df_rois, paths_dict = image_group
+
+    img = load_image(paths_dict['img'])
+    mask = load_image(paths_dict['mask'])
+
+    if img is None or mask is None:
+        return []
+
+    feature_cols = build_new_feature_column_names()
+    rows = []
+
+    for _, roi_row in df_rois.iterrows():
+        xmin, ymin = int(roi_row['xmin']), int(roi_row['ymin'])
+        xmax, ymax = int(roi_row['xmax']), int(roi_row['ymax'])
+
+        raw_crop = img[ymin:ymax, xmin:xmax]
+        mask_crop = mask[ymin:ymax, xmin:xmax]
+
+        if raw_crop.shape[:2] != (roi_size, roi_size):
+            # In case corner adjustments left edge anomalies
+            continue
+
+        # Extract the 46 features using the paper methodology
+        new_feats = extract_new_features(raw_crop, mask_crop)
+
+        feat_row = {
+            'roi_name': roi_row['roi_name'],
+            'image_name': roi_row['image_name'],
+            'label': int(roi_row['label'])
+        }
+
+        for col, val in zip(feature_cols, new_feats):
+            feat_row[col] = val
+
+        rows.append(feat_row)
+
+    return rows
