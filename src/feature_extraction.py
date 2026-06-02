@@ -5,6 +5,9 @@ from src.utils import load_image
 from scipy.stats import kurtosis, skew
 from skimage.measure import shannon_entropy
 from pathlib import Path
+from skimage.transform import radon
+from skimage.measure import regionprops, label as sk_label
+
 
 def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
     """
@@ -551,6 +554,9 @@ def _extract_features_for_image(args, roi_size, half_size, labeling_threshold, g
     frame_stem = p.stem.replace('_processed', '')
     image_name = f"{patient_id}_{serie_id}_{frame_stem}"
 
+    print(f"Extracting features from image {frame_stem} of patient {patient_id}, serie {serie_id}")
+
+
     sampled_boxes  = extract_rois(skeleton, img_shape, roi_size=roi_size, total_rois=100)
     sampled_labels = label_rois(sampled_boxes, gt_boxes, threshold=labeling_threshold)
 
@@ -578,8 +584,14 @@ def _extract_features_for_image(args, roi_size, half_size, labeling_threshold, g
         raw_feats   = extract_raw_roi_features(raw_crop)
         gabor_feats = apply_gabor_and_extract_features(raw_crop, gabor_bank)
         width_ratio = extract_width_ratio_feature(mask_crop, skel_crop)
+        new_feats = extract_new_features(raw_crop, mask_crop)  # ← added
 
-        full_feat_vector = np.concatenate([raw_feats, gabor_feats, [width_ratio]])
+        full_feat_vector = np.concatenate([  # ← updated
+            raw_feats,
+            gabor_feats,
+            [width_ratio],
+            new_feats,
+        ])
 
         feat_row = {'roi_name': f"{image_name}_{roi_idx}"}
         for col, val in zip(feature_cols, full_feat_vector):
@@ -588,3 +600,196 @@ def _extract_features_for_image(args, roi_size, half_size, labeling_threshold, g
         rows.append(feat_row)
 
     return rows
+
+
+def _compute_glcm(image_uint8, angle_deg, distance=1, levels=64):
+    """
+    Computes a single normalised symmetric GLCM matrix using numpy.
+    Image is requantized to `levels` grey levels for efficiency.
+    """
+    # Requantize to `levels` bins
+    img = (image_uint8.astype(np.float32) / 256.0 * levels).astype(np.uint8)
+    img = np.clip(img, 0, levels - 1)
+
+    h, w = img.shape
+    angle_rad = np.deg2rad(angle_deg)
+    dy = -int(round(distance * np.sin(angle_rad)))
+    dx =  int(round(distance * np.cos(angle_rad)))
+
+    # Source and target slices for the given offset (dy, dx)
+    y_src = slice(max(0, -dy), h + min(0, -dy))
+    y_tgt = slice(max(0,  dy), h + min(0,  dy))
+    x_src = slice(max(0, -dx), w + min(0, -dx))
+    x_tgt = slice(max(0,  dx), w + min(0,  dx))
+
+    p_src = img[y_src, x_src].ravel()
+    p_tgt = img[y_tgt, x_tgt].ravel()
+
+    glcm = np.zeros((levels, levels), dtype=np.float64)
+    np.add.at(glcm, (p_src, p_tgt), 1)
+
+    # Symmetric: count both directions
+    glcm = glcm + glcm.T
+
+    total = glcm.sum()
+    if total > 0:
+        glcm /= total
+
+    return glcm
+
+
+def _glcm_properties(glcm, levels=64):
+    """
+    Computes contrast, correlation, energy (ASM) and homogeneity (IDM)
+    from a normalised GLCM matrix.
+    """
+    I, J = np.meshgrid(np.arange(levels), np.arange(levels), indexing='ij')
+
+    contrast    = float(np.sum(glcm * (I - J) ** 2))
+    energy      = float(np.sum(glcm ** 2))
+    homogeneity = float(np.sum(glcm / (1.0 + np.abs(I - J))))
+
+    mu_i  = np.sum(I * glcm)
+    mu_j  = np.sum(J * glcm)
+    std_i = np.sqrt(np.sum(glcm * (I - mu_i) ** 2))
+    std_j = np.sqrt(np.sum(glcm * (J - mu_j) ** 2))
+
+    if std_i < 1e-10 or std_j < 1e-10:
+        correlation = 0.0
+    else:
+        correlation = float(np.sum(glcm * (I - mu_i) * (J - mu_j)) / (std_i * std_j))
+
+    return contrast, correlation, energy, homogeneity
+
+
+def _extract_glcm_features(roi_uint8, levels=64):
+    """
+    16 GLCM features: contrast, correlation, energy, homogeneity
+    each at 4 angles (0°, 45°, 90°, 135°).
+    """
+    angles   = [0, 45, 90, 135]
+    features = []
+
+    contrasts    = []
+    correlations = []
+    energies     = []
+    homogeneities = []
+
+    for angle in angles:
+        glcm = _compute_glcm(roi_uint8, angle_deg=angle, levels=levels)
+        c, r, e, h = _glcm_properties(glcm, levels=levels)
+        contrasts.append(c)
+        correlations.append(r)
+        energies.append(e)
+        homogeneities.append(h)
+
+    # Paper order: all 4 angles per property
+    features.extend(contrasts)
+    features.extend(correlations)
+    features.extend(energies)
+    features.extend(homogeneities)
+
+    return features  # 16 values
+
+
+def _extract_radon_features(roi):
+    """
+    12 Radon transform features.
+    Mean, Std, Variance of projections at 0°, 45°, 90°, 135°.
+
+    Returns list of 12 values in paper order:
+        mean × 4 angles | std × 4 angles | var × 4 angles
+    """
+    angles    = [0, 45, 90, 135]
+    sinogram  = radon(roi.astype(np.float64), theta=angles, circle=False)
+    # sinogram shape: (n_projections, 4)
+
+    means = [float(np.mean(sinogram[:, i])) for i in range(4)]
+    stds  = [float(np.std (sinogram[:, i])) for i in range(4)]
+    vars_ = [float(np.var (sinogram[:, i])) for i in range(4)]
+
+    return means + stds + vars_   # 12 values
+
+
+def _extract_morphology_features(mask_roi):
+    """
+    12 region-based morphology / shape features extracted from the
+    largest connected component in the binary mask.
+
+    Returns list of 12 values in paper order:
+        area, perimeter, major_axis_length, minor_axis_length,
+        eccentricity, orientation, convex_area, filled_area,
+        solidity, extent, equivalent_diameter, euler_number.
+
+    Returns zeros if the mask contains no foreground pixels.
+    """
+    labeled     = sk_label(mask_roi.astype(np.uint8))
+    props_list  = regionprops(labeled)
+
+    if not props_list:
+        return [0.0] * 12
+
+    # Use the largest connected component
+    region = max(props_list, key=lambda r: r.area)
+
+    # equivalent_diameter was renamed in skimage 0.20
+    try:
+        equiv_diam = region.equivalent_diameter
+    except AttributeError:
+        equiv_diam = region.equivalent_diameter_area
+
+    return [
+        float(region.area),
+        float(region.perimeter),
+        float(region.major_axis_length),
+        float(region.minor_axis_length),
+        float(region.eccentricity),
+        float(region.orientation),
+        float(region.convex_area),
+        float(region.filled_area),
+        float(region.solidity),
+        float(region.extent),
+        float(equiv_diam),
+        float(region.euler_number),
+    ]
+
+
+def extract_new_features(roi, mask_roi=None):
+    """
+    Extracts 47 features from a single ROI following the paper methodology.
+    Applied to the full ROI only (no tiling).
+
+    Feature groups:
+        [ 0: 7 ]  First-order statistics          (7)
+        [ 7:23 ]  GLCM texture features           (16)
+        [23:35 ]  Radon transform features        (12)
+        [35:47 ]  Vessel morphology/shape         (12)
+                                            Total: 47
+
+    Parameters:
+        roi      : 2D numpy array (H, W), raw or processed grayscale crop
+        mask_roi : 2D binary numpy array (H, W), vessel mask crop.
+                   If None, Otsu thresholding is applied to roi internally.
+
+    Returns:
+        feature_vector : list of 47 floats
+    """
+    # Ensure uint8 for GLCM (which requires integer pixel values)
+    if roi.dtype != np.uint8:
+        roi_uint8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        roi_uint8 = roi
+
+    if mask_roi is None:
+        _, binary = cv2.threshold(roi_uint8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask_binary = binary
+    else:
+        mask_binary = (mask_roi > 0).astype(np.uint8)
+
+    features = []
+    features.extend(extract_stats(roi))  # 6  (reuses existing)
+    features.extend(_extract_glcm_features(roi_uint8))  # 16
+    features.extend(_extract_radon_features(roi))  # 12
+    features.extend(_extract_morphology_features(mask_binary))  # 12
+                                                    # Total: 46
+    return features
