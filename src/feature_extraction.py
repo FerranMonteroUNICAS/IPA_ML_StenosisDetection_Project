@@ -1,12 +1,16 @@
 import numpy as np
 import cv2
 import matplotlib.pyplot as plt
-from src.utils import load_image
+from src.utils import *
 from scipy.stats import kurtosis, skew
 from skimage.measure import shannon_entropy
 from pathlib import Path
 from skimage.transform import radon
 from skimage.measure import regionprops, label as sk_label
+from skimage.feature import hog
+from shapely.geometry import box as shapely_box, Polygon
+from scipy.spatial import cKDTree
+from skimage.feature import local_binary_pattern
 
 
 def extract_rois(skeleton, img_shape, roi_size=80, total_rois=100):
@@ -128,55 +132,55 @@ def label_rois(candidate_rois, gt_boxes, threshold=0.50):
     return labels
 
 
-def build_gabor_bank(ksize=31, n_sizes=4, n_orientations=8):
+def build_gabor_bank(ksize=31, n_orientations=12, n_sizes=6):
     """
     Builds a bank of Gabor filters at various scales and orientations.
 
     Parameters:
-        ksize          : int, the size of the kernel (e.g., 31 means a 31x31 matrix)
-        n_sizes        : int, number of different frequencies/thicknesses to detect
-        n_orientations : int, number of angles (e.g., 12 means every 15 degrees)
+        ksize          : int, kernel size (default 31)
+        n_orientations : int, number of orientations (default 12, every 15 degrees)
+        n_sizes        : int, number of scales (default 6)
 
     Returns:
-        filters        : list of cv2 Gabor kernels
+        filters : list of 72 cv2 Gabor kernels (12 orientations x 6 sizes)
     """
-    filters = []
-
-    # 1. Calculate orientations (theta) - e.g., 12 steps from 0 to 180 degrees (Pi)
-    thetas = np.arange(0, np.pi, np.pi / n_orientations)
-
-    # 2. Calculate wavelengths (lambda) - controls the thickness of the vessel we want to detect
-    # A good range for an 80x80 image is wavelengths from roughly 4 pixels up to 16 pixels
-    lambdas = np.linspace(4, 20, n_sizes)
-
-    # Default parameters for medical imaging Gabor filters
-    gamma = 0.5  # Spatial aspect ratio (0.5 makes it slightly elliptical, good for tubes)
-    psi = 0  # Phase offset (0 makes it perfectly centered)
+    filters  = []
+    thetas   = np.arange(0, np.pi, np.pi / n_orientations)
+    lambdas  = np.linspace(4, 20, n_sizes)
+    gamma    = 0.5
+    psi      = 0
 
     for theta in thetas:
         for lamda in lambdas:
-            # Sigma controls the size of the Gaussian envelope.
-            # Tying it to lambda ensures the filter scales properly.
-            sigma = 0.56 * lamda
-
-            # Generate the kernel
+            sigma  = 0.56 * lamda
             kernel = cv2.getGaborKernel(
-                (ksize, ksize),
-                sigma,
-                theta,
-                lamda,
-                gamma,
-                psi,
-                ktype=cv2.CV_32F  # Using 32-bit floats for high precision
+                (ksize, ksize), sigma, theta, lamda, gamma, psi,
+                ktype=cv2.CV_32F
             )
-
-            # Normalize the kernel (helps ensure different scales have comparable energy)
             kernel /= 1.5 * kernel.sum() if kernel.sum() != 0 else 1.0
-
             filters.append(kernel)
 
-    print(f"Built Gabor bank with {len(filters)} filters ({n_orientations} orientations x {n_sizes} sizes).")
+    print(f"Built Gabor bank: {len(filters)} filters "
+          f"({n_orientations} orientations x {n_sizes} sizes).")
     return filters
+
+
+def _get_longitudinal_tiles(patch):
+    """
+    Splits a patch into two halves along the long axis (width).
+    For a 100x50 oriented ROI this gives two 50x50 tiles:
+        - left half  : patch along the first half of the vessel
+        - right half : patch along the second half of the vessel
+
+    Works for any patch where width >= height.
+
+    Returns:
+        list of two 2D np.ndarray tiles [left, right]
+    """
+    h, w  = patch.shape[:2]
+    mid_w = w // 2
+    return [patch[:, :mid_w], patch[:, mid_w:]]
+
 
 def extract_stats(patch):
     """
@@ -233,6 +237,43 @@ def apply_gabor_and_extract_features(roi, filters):
 
     return np.array(features, dtype=np.float32)
 
+
+def apply_gabor_and_extract_features_oriented(roi, filters):
+    """
+    Applies a bank of Gabor filters to an oriented ROI and extracts:
+        - 6 stats from the full filtered patch     (global)
+        - 6 stats from each of 2 longitudinal tiles (left, right halves)
+
+    Total per filter : 6 + 2 x 6 = 18
+    Total overall    : 18 x len(filters)
+
+    For a 72-filter bank: 18 x 72 = 1,296 features.
+
+    Parameters:
+        roi     : 2D numpy array, the straightened oriented patch (e.g. 50x100)
+        filters : list of cv2 Gabor kernels from build_gabor_bank()
+
+    Returns:
+        feature_vector : 1D numpy array
+    """
+    features = []
+    tiles    = _get_longitudinal_tiles(roi)
+
+    for kernel in filters:
+        filtered = cv2.filter2D(roi, cv2.CV_32F, kernel,
+                                borderType=cv2.BORDER_REFLECT)
+        # Global (6)
+        features.extend(extract_stats(filtered))
+
+        # Longitudinal tiles (2 x 6 = 12)
+        for tile in tiles:
+            filtered_tile = cv2.filter2D(tile, cv2.CV_32F, kernel,
+                                         borderType=cv2.BORDER_REFLECT)
+            features.extend(extract_stats(filtered_tile))
+
+    return np.array(features, dtype=np.float32)
+
+
 def extract_raw_roi_features(roi):
     """
     Extracts 6 statistical features from the raw (unfiltered) ROI
@@ -264,6 +305,32 @@ def extract_raw_roi_features(roi):
         features.extend(extract_stats(tile))
 
     return np.array(features, dtype=np.float32)
+
+
+def extract_raw_roi_features_oriented(roi):
+    """
+    Extracts 6 statistical features from the raw oriented ROI globally
+    and from its 2 longitudinal tiles (left/right halves along the vessel).
+
+    Total: 6 (global) + 2 x 6 (tiles) = 18 features.
+
+    Parameters:
+        roi : 2D numpy array (H, W)
+
+    Returns:
+        feature_vector : 1D numpy array of 18 features
+    """
+    features = []
+
+    # Global (6)
+    features.extend(extract_stats(roi))
+
+    # Longitudinal tiles (2 x 6 = 12)
+    for tile in _get_longitudinal_tiles(roi):
+        features.extend(extract_stats(tile))
+
+    return np.array(features, dtype=np.float32)
+
 
 def _order_skeleton_points(skeleton_roi):
     """
@@ -364,6 +431,36 @@ def extract_width_ratio_feature(mask_roi, skeleton_roi, tangent_window=5):
         return 1.0
 
     return float(max_w / min_w)
+
+
+def extract_lbp_features(roi):
+    """
+    Extracts LBP histogram features at two scales:
+        - Scale 1: radius=1, n_points=8  → 10 uniform bins
+        - Scale 2: radius=2, n_points=16 → 18 uniform bins
+
+    Total: 10 + 18 = 28 features.
+
+    Parameters:
+        roi : 2D numpy array (H, W), grayscale uint8 or float
+
+    Returns:
+        feature_vector : 1D numpy array of 28 features (normalized histograms)
+    """
+    if roi.dtype != np.uint8:
+        roi_u8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        roi_u8 = roi
+
+    features = []
+    for radius, n_points in [(1, 8), (2, 16)]:
+        lbp     = local_binary_pattern(roi_u8, n_points, radius, method='uniform')
+        n_bins  = n_points + 2
+        hist, _ = np.histogram(lbp, bins=n_bins, range=(0, n_bins), density=True)
+        features.extend(hist.tolist())
+
+    return np.array(features, dtype=np.float32)
+
 
 def build_feature_column_names(n_filters, stat_names, tile_labels):
     """
@@ -602,6 +699,257 @@ def _extract_features_for_image(args, roi_size, half_size, labeling_threshold, g
     return rows
 
 
+def extract_oriented_roi_features(img_patch, mask_patch, skel_patch, gabor_bank):
+    """
+    Extracts the full feature vector for a single oriented ROI patch.
+    All patches must already be affine-cropped (straightened) via crop_oriented_roi.
+
+    Feature layout (1,392 total):
+        [    0: 1296]  Gabor stats: 72 filters x 18 (global + 2 tiles x 6)
+        [ 1296: 1314]  Raw ROI stats: 18 (global + 2 tiles x 6)
+        [ 1314: 1363]  Paper features (Gil-Rios et al.): 49
+        [ 1363: 1391]  LBP histograms at 2 scales: 28
+        [ 1391: 1392]  Width ratio: 1
+
+    Parameters:
+        img_patch   : 2D numpy array (H, W) — affine-cropped processed image patch
+        mask_patch  : 2D numpy array (H, W) — affine-cropped vessel mask patch
+        skel_patch  : 2D numpy array (H, W) — affine-cropped skeleton patch
+        gabor_bank  : list of cv2 kernels from build_gabor_bank(n_orientations=12, n_sizes=6)
+
+    Returns:
+        feature_vector : 1D numpy array of 1,392 floats
+    """
+    img_f32 = img_patch.astype(np.float32)
+
+    gabor_feats  = apply_gabor_and_extract_features_oriented(img_f32, gabor_bank)  # 1296
+    raw_feats    = extract_raw_roi_features_oriented(img_f32)                       #   18
+    paper_feats  = np.array(
+                       extract_new_features(img_patch, mask_patch, skel_patch),
+                       dtype=np.float32)                                            #   49
+    lbp_feats    = extract_lbp_features(img_patch)                                 #   28
+    width_ratio  = extract_width_ratio_feature(mask_patch, skel_patch)             #    1
+
+    return np.concatenate([
+        gabor_feats,
+        raw_feats,
+        paper_feats,
+        lbp_feats,
+        [width_ratio],
+    ])
+
+
+def build_oriented_feature_column_names(n_filters=72):
+    """
+    Generates ordered column names matching extract_oriented_roi_features() output.
+
+    Returns: list of 1,392 strings
+    """
+    STATS      = ['mean', 'var', 'entropy', 'energy', 'kurtosis', 'skewness']
+    TILES      = ['global', 'left', 'right']
+    HARALICK   = ['asm', 'contrast', 'correlation', 'variance', 'idm',
+                  'sum_avg', 'sum_var', 'sum_entropy', 'entropy',
+                  'diff_var', 'diff_entropy', 'imc1', 'imc2', 'mcc']
+    WELIKALA   = ['vessel_px', 'n_segments', 'density', 'tortuosity',
+                  'vessel_length', 'bifurcations', 'grey_cv',
+                  'gradient_mean', 'gradient_cv', 'mean_width']
+
+    cols = []
+
+    # Gabor (72 filters x 3 regions x 6 stats = 1,296)
+    for i in range(n_filters):
+        for tile in TILES:
+            for stat in STATS:
+                cols.append(f"gabor_f{i}_{tile}_{stat}")
+
+    # Raw ROI (3 regions x 6 stats = 18)
+    for tile in TILES:
+        for stat in STATS:
+            cols.append(f"raw_{tile}_{stat}")
+
+    # Paper features (49)
+    for h in HARALICK:
+        cols.append(f"paper_haralick_{h}")
+    cols += ['paper_px_min', 'paper_px_max', 'paper_px_mean', 'paper_px_std']
+    for w in WELIKALA:
+        cols.append(f"paper_weli_{w}")
+    cols += ['paper_seg_len_std_min', 'paper_seg_len_std_max', 'paper_seg_len_std_mean']
+    cols += ['paper_radon_ratio_x', 'paper_radon_ratio_y',
+             'paper_radon_mean',    'paper_radon_std']
+    for h in HARALICK:
+        cols.append(f"paper_radon_haralick_{h}")
+
+    # LBP (28)
+    for radius, n_points in [(1, 8), (2, 16)]:
+        for b in range(n_points + 2):
+            cols.append(f"lbp_r{radius}_bin{b}")
+
+    # Width ratio (1)
+    cols.append("width_ratio")
+
+    return cols  # 1,392 total
+
+
+def process_one_image_oriented(args):
+    """
+    Top-level worker for ProcessPoolExecutor — extracts oriented ROIs and their
+    full feature vectors for a single image frame.
+
+    Args:
+        args : tuple of (img_path, mask_path, skel_path, gt_boxes, gabor_bank,
+                         feature_cols, total_rois, rect_width, rect_height)
+
+    Returns:
+        list of dicts, one per ROI, with keys:
+            roi_name, image_name, center_x, center_y, angle,
+            width, height, label, + all feature columns.
+        Returns [] on failure.
+    """
+    import time
+    import traceback
+
+    (img_path, mask_path, skel_path, gt_boxes,
+     gabor_bank, feature_cols, total_rois,
+     rect_width, rect_height) = args
+
+    try:
+        t_start = time.time()
+        print(f"[WORKER] ── START ── {img_path}", flush=True)
+
+        # ── 1. Load images ────────────────────────────────────────────────────
+        img      = load_image(img_path)
+        mask     = load_image(mask_path)
+        skeleton = load_image(skel_path)
+
+        if img is None or mask is None or skeleton is None:
+            print(f"[WORKER]   SKIP — failed to load one or more images", flush=True)
+            return []
+
+        img_shape = img.shape[:2]
+
+        # ── 2. Build image metadata ───────────────────────────────────────────
+        p          = Path(img_path)
+        patient_id = p.parts[-3]
+        serie_id   = p.parts[-2]
+        frame_stem = p.stem.replace('_processed', '')
+        image_name = f"{patient_id}_{serie_id}_{frame_stem}"
+
+        print(f"[WORKER]   image_name : {image_name}", flush=True)
+
+        # ── 3. Extract oriented ROIs ──────────────────────────────────────────
+        t0 = time.time()
+        oriented_rois = extract_oriented_rois(
+            skeleton, img_shape,
+            total_rois=total_rois,
+            rect_width=rect_width,
+            rect_height=rect_height
+        )
+        print(f"[WORKER]   extract_oriented_rois done in {time.time()-t0:.2f}s"
+              f" — {len(oriented_rois)} ROIs", flush=True)
+
+        # ── 4. Add GT-centred ROI for each ground truth box ───────────────────
+        # Orientation: tangent of the nearest skeleton point to the GT centre
+        y_skel, x_skel = np.where(skeleton > 0)
+        skel_pts       = np.column_stack([x_skel, y_skel])
+        ordered        = _order_skeleton_points_fast(skeleton)
+
+        for gt_box in gt_boxes:
+            cx_gt = (gt_box['xmin'] + gt_box['xmax']) // 2
+            cy_gt = (gt_box['ymin'] + gt_box['ymax']) // 2
+
+            if len(skel_pts) > 0:
+                # Find nearest skeleton point to GT centre
+                dists      = np.sum((skel_pts - np.array([cx_gt, cy_gt])) ** 2, axis=1)
+                nearest_pt = tuple(skel_pts[np.argmin(dists)])
+
+                # Find its index in the ordered sequence for tangent estimation
+                try:
+                    nearest_idx = ordered.index(nearest_pt)
+                except ValueError:
+                    # Point not in ordered list (shouldn't happen) — use GT centre
+                    nearest_idx = None
+            else:
+                nearest_idx = None
+
+            if nearest_idx is not None:
+                tangent_window = 10
+                i_start = max(0, nearest_idx - tangent_window)
+                i_end   = min(len(ordered) - 1, nearest_idx + tangent_window)
+                dx = ordered[i_end][0] - ordered[i_start][0]
+                dy = ordered[i_end][1] - ordered[i_start][1]
+
+                if dx == 0 and dy == 0:
+                    angle_deg = 0.0
+                else:
+                    if dx < 0:
+                        dx, dy = -dx, -dy
+                    angle_deg = float(np.degrees(np.arctan2(dy, dx))) % 180.0
+
+                # Snap centre to the nearest skeleton point
+                cx, cy = nearest_pt
+            else:
+                angle_deg = 0.0
+                cx, cy    = cx_gt, cy_gt
+
+            oriented_rois.append({
+                'center': (cx, cy),
+                'angle' : angle_deg,
+                'width' : rect_width,
+                'height': rect_height,
+            })
+
+        print(f"[WORKER]   total ROIs  : {len(oriented_rois)}"
+              f" ({total_rois} sampled + {len(gt_boxes)} GT-centred)", flush=True)
+
+        # ── 5. Label all ROIs ─────────────────────────────────────────────────
+        labels = label_oriented_rois(oriented_rois, gt_boxes)
+
+        # ── 6. Extract features for each ROI ──────────────────────────────────
+        rows = []
+        for roi_idx, (roi, lbl) in enumerate(zip(oriented_rois, labels), start=1):
+
+            # Affine crop of image, mask and skeleton
+            img_patch  = crop_oriented_roi(img,      roi)
+            mask_patch = crop_oriented_roi(mask,     roi)
+            skel_patch = crop_oriented_roi(skeleton, roi)
+
+            # Validate patch size (safety check)
+            expected = (roi['height'], roi['width'])
+            if img_patch.shape != expected:
+                print(f"[WORKER]   SKIP ROI {roi_idx} — unexpected shape "
+                      f"{img_patch.shape}", flush=True)
+                continue
+
+            # Extract full feature vector
+            feat_vector = extract_oriented_roi_features(
+                img_patch, mask_patch, skel_patch, gabor_bank
+            )
+
+            row = {
+                'roi_name'  : f"{image_name}_{roi_idx}",
+                'image_name': image_name,
+                'center_x'  : roi['center'][0],
+                'center_y'  : roi['center'][1],
+                'angle'     : roi['angle'],
+                'width'     : roi['width'],
+                'height'    : roi['height'],
+                'label'     : lbl,
+            }
+            for col, val in zip(feature_cols, feat_vector):
+                row[col] = val
+
+            rows.append(row)
+
+        print(f"[WORKER] ── DONE {image_name} — {len(rows)} rows "
+              f"in {time.time()-t_start:.2f}s ──", flush=True)
+        return rows
+
+    except Exception:
+        print(f"[WORKER ERROR] {img_path}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return []
+
+
 def _compute_glcm(image_uint8, angle_deg, distance=1, levels=64):
     """
     Computes a single normalised symmetric GLCM matrix using numpy.
@@ -753,81 +1101,390 @@ def _extract_morphology_features(mask_roi):
         float(region.euler_number),
     ]
 
+# ══════════════════════════════════════════════════════════════════════════════
+#  PAPER-FAITHFUL FEATURE EXTRACTION
+#  Implements all 49 features from Gil-Rios et al. 2021 (Mathematics 9, 2471).
+#  All intensity-based features (Haralick, Radon, pixel stats) are computed on
+#  the subtracted image (img_gsub / dataset_subtracted) to preserve meaningful
+#  intensity distributions. Shape/morphology features use the mask + skeleton.
+# ══════════════════════════════════════════════════════════════════════════════
 
-def extract_new_features(roi, mask_roi=None):
+def _haralick_full(image_uint8, levels=64):
     """
-    Extracts 47 features from a single ROI following the paper methodology.
-    Applied to the full ROI only (no tiling).
+    14 Haralick properties averaged over 4 angles (0, 45, 90, 135 deg).
+    Paper features 1–14 (direct) and 36–49 (applied to Radon sinogram).
 
-    Feature groups:
-        [ 0: 7 ]  First-order statistics          (7)
-        [ 7:23 ]  GLCM texture features           (16)
-        [23:35 ]  Radon transform features        (12)
-        [35:47 ]  Vessel morphology/shape         (12)
-                                            Total: 47
+    Order:
+      0  ASM (energy)            paper feat 1 / 36
+      1  contrast                paper feat 2 / 37
+      2  correlation             paper feat 3 / 38
+      3  variance                paper feat 4 / 39
+      4  IDM (homogeneity)       paper feat 5 / 40
+      5  sum_average             paper feat 6 / 41
+      6  sum_variance            paper feat 7 / 42
+      7  sum_entropy             paper feat 8 / 43
+      8  entropy                 paper feat 9 / 44
+      9  difference_variance     paper feat 10 / 45
+     10  difference_entropy      paper feat 11 / 46
+     11  IMC1                    paper feat 12 / 47
+     12  IMC2                    paper feat 13 / 48
+     13  MCC                     paper feat 14 / 49
 
-    Parameters:
-        roi      : 2D numpy array (H, W), raw or processed grayscale crop
-        mask_roi : 2D binary numpy array (H, W), vessel mask crop.
-                   If None, Otsu thresholding is applied to roi internally.
-
-    Returns:
-        feature_vector : list of 47 floats
+    Returns: list of 14 floats
     """
-    # Ensure uint8 for GLCM (which requires integer pixel values)
-    if roi.dtype != np.uint8:
-        roi_uint8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    img = (image_uint8.astype(np.float32) / 256.0 * levels).astype(np.uint8)
+    img = np.clip(img, 0, levels - 1)
+    angles_deg = [0, 45, 90, 135]
+    accum = np.zeros(14, dtype=np.float64)
+    for angle_deg in angles_deg:
+        glcm = _compute_glcm(img, angle_deg, levels=levels)
+        accum += _glcm_14_props(glcm, levels)
+    return list(accum / len(angles_deg))
+
+
+def _glcm_14_props(glcm, levels):
+    """
+    All 14 Haralick properties from a normalised GLCM.
+    Formulae per Haralick et al. 1973 and Soh & Tsatsoulis 1999.
+    """
+    N   = levels
+    eps = 1e-12
+    I, J = np.meshgrid(np.arange(N), np.arange(N), indexing='ij')
+
+    px = glcm.sum(axis=1)
+    py = glcm.sum(axis=0)
+
+    # p_{x+y} and p_{x-y} marginals
+    pxy_sum  = np.zeros(2 * N, dtype=np.float64)
+    pxy_diff = np.zeros(N,     dtype=np.float64)
+    for i in range(N):
+        for j in range(N):
+            pxy_sum [i + j]      += glcm[i, j]
+            pxy_diff[abs(i - j)] += glcm[i, j]
+
+    mu_x  = np.sum(np.arange(N) * px)
+    mu_y  = np.sum(np.arange(N) * py)
+    std_x = np.sqrt(np.sum((np.arange(N) - mu_x) ** 2 * px))
+    std_y = np.sqrt(np.sum((np.arange(N) - mu_y) ** 2 * py))
+
+    asm      = float(np.sum(glcm ** 2))
+    contrast = float(np.sum((I - J) ** 2 * glcm))
+
+    if std_x < eps or std_y < eps:
+        correlation = 0.0
     else:
-        roi_uint8 = roi
+        correlation = float((np.sum(I * J * glcm) - mu_x * mu_y) / (std_x * std_y))
+
+    mu    = np.sum(I * glcm)
+    variance = float(np.sum((I - mu) ** 2 * glcm))
+    idm      = float(np.sum(glcm / (1.0 + (I - J) ** 2)))
+
+    k_sum   = np.arange(2 * N)
+    sum_avg = float(np.sum(k_sum * pxy_sum))
+
+    pxy_s   = np.where(pxy_sum > eps, pxy_sum, eps)
+    sum_ent = -float(np.sum(pxy_sum * np.log(pxy_s)))
+    sum_var = float(np.sum((k_sum - sum_ent) ** 2 * pxy_sum))
+    sum_entropy = sum_ent
+
+    glcm_s  = np.where(glcm > eps, glcm, eps)
+    entropy = -float(np.sum(glcm * np.log(glcm_s)))
+
+    k_diff    = np.arange(N)
+    mean_diff = np.sum(k_diff * pxy_diff)
+    diff_var  = float(np.sum((k_diff - mean_diff) ** 2 * pxy_diff))
+    pxy_ds    = np.where(pxy_diff > eps, pxy_diff, eps)
+    diff_ent  = -float(np.sum(pxy_diff * np.log(pxy_ds)))
+
+    px_s = np.where(px > eps, px, eps)
+    py_s = np.where(py > eps, py, eps)
+    HX   = -float(np.sum(px * np.log(px_s)))
+    HY   = -float(np.sum(py * np.log(py_s)))
+    HXY  = entropy
+    outer = np.outer(px_s, py_s)
+    HXY1  = -float(np.sum(glcm * np.log(outer)))
+    HXY2  = -float(np.sum(outer * np.log(outer)))
+
+    denom = max(HX, HY)
+    imc1  = (HXY - HXY1) / denom if denom > eps else 0.0
+    imc2  = float(np.sqrt(max(0.0, 1.0 - np.exp(-2.0 * (HXY2 - HXY)))))
+
+    try:
+        Q = np.zeros((N, N), dtype=np.float64)
+        denom_q = np.outer(px, py)
+        denom_q = np.where(denom_q > eps, denom_q, eps)
+        for i in range(N):
+            Q[i, :] = np.sum(
+                glcm[i, :, None] * glcm / denom_q, axis=0
+            )
+        eigvals = np.sort(np.abs(np.linalg.eigvals(Q)))[::-1]
+        mcc = float(np.sqrt(max(0.0, eigvals[1]))) if len(eigvals) > 1 else 0.0
+    except Exception:
+        mcc = 0.0
+
+    return np.array([
+        asm, contrast, correlation, variance, idm,
+        sum_avg, sum_var, sum_entropy, entropy,
+        diff_var, diff_ent, imc1, imc2, mcc
+    ], dtype=np.float64)
+
+
+def _radon_ratios(roi):
+    """
+    Radon Ratio-X (feat 32) and Ratio-Y (feat 33).
+    Relative energy of 0° vs 90° projections in the sinogram.
+    """
+    sinogram     = radon(roi.astype(np.float64), theta=[0, 45, 90, 135], circle=False)
+    total_energy = np.sum(sinogram ** 2) + 1e-12
+    ratio_x = float(np.sum(sinogram[:, 0] ** 2) / total_energy)
+    ratio_y = float(np.sum(sinogram[:, 2] ** 2) / total_energy)
+    return [ratio_x, ratio_y]
+
+
+def _order_skeleton_pts(skeleton_roi):
+    """Nearest-neighbour walk on skeleton pixels."""
+    yy, xx = np.where(skeleton_roi > 0)
+    if len(xx) == 0:
+        return []
+    available = set(zip(xx.tolist(), yy.tolist()))
+    current   = next(iter(available))
+    ordered   = [current]
+    available.remove(current)
+    while available:
+        pts   = np.array(list(available))
+        dists = np.sum((pts - np.array(current)) ** 2, axis=1)
+        current = tuple(pts[np.argmin(dists)])
+        ordered.append(current)
+        available.remove(current)
+    return ordered
+
+
+def _get_segments(skeleton_roi):
+    """Connected components of skeleton, each ordered by nearest-neighbour walk."""
+    labeled   = sk_label(skeleton_roi.astype(np.uint8), connectivity=2)
+    segments  = []
+    for lbl in range(1, labeled.max() + 1):
+        pts = _order_skeleton_pts(labeled == lbl)
+        if pts:
+            segments.append(pts)
+    return segments
+
+
+def _chain_code_length(pts):
+    """True path length: cardinal steps = 1, diagonal steps = √2."""
+    if len(pts) < 2:
+        return 1.0
+    total = 0.0
+    for i in range(len(pts) - 1):
+        dx = abs(pts[i+1][0] - pts[i][0])
+        dy = abs(pts[i+1][1] - pts[i][1])
+        total += np.sqrt(2) if (dx == 1 and dy == 1) else 1.0
+    return total
+
+
+def _euclidean_length(pts):
+    if len(pts) < 2:
+        return 1.0
+    return float(np.linalg.norm(np.array(pts[0]) - np.array(pts[-1])))
+
+
+def _count_bifurcations(skeleton_roi):
+    """Pixels with ≥ 3 skeleton neighbours (paper feat 24)."""
+    skel   = (skeleton_roi > 0).astype(np.uint8)
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    nbrs   = cv2.filter2D(skel, cv2.CV_32F, kernel) - skel.astype(np.float32)
+    return int(np.sum((skel == 1) & (nbrs >= 3)))
+
+
+def _welikala_features(roi_u8, mask_bin, skel_bin):
+    """
+    10 Welikala shape features — paper features 19–28.
+    Computed from mask and skeleton crops.
+    """
+    vessel_px  = int(mask_bin.sum())
+    segments   = _get_segments(skel_bin)
+    n_segments = len(segments)
+    density    = vessel_px / mask_bin.size if mask_bin.size > 0 else 0.0
+
+    tortuosities = []
+    for seg in segments:
+        cl = _chain_code_length(seg)
+        el = _euclidean_length(seg)
+        tortuosities.append(cl / el if el > 0 else 1.0)
+    mean_tortuosity = float(np.mean(tortuosities)) if tortuosities else 1.0
+
+    vessel_length = int(skel_bin.sum())
+    bif_count     = _count_bifurcations(skel_bin)
+
+    vessel_int = roi_u8[mask_bin == 1].astype(np.float64)
+    if len(vessel_int) > 0:
+        mean_gl = np.mean(vessel_int)
+        grey_cv = np.std(vessel_int) / mean_gl if mean_gl > 1e-6 else 0.0
+    else:
+        grey_cv = 0.0
+
+    roi_f    = roi_u8.astype(np.float32)
+    grad_mag = np.sqrt(cv2.Sobel(roi_f, cv2.CV_64F, 1, 0, ksize=3) ** 2 +
+                       cv2.Sobel(roi_f, cv2.CV_64F, 0, 1, ksize=3) ** 2)
+    vgrad = grad_mag[mask_bin == 1]
+    if len(vgrad) > 0:
+        grad_mean = float(np.mean(vgrad))
+        grad_cv   = float(np.std(vgrad)) / grad_mean if grad_mean > 1e-6 else 0.0
+    else:
+        grad_mean = 0.0
+        grad_cv   = 0.0
+
+    ordered_all = _order_skeleton_pts(skel_bin)
+    widths = []
+    if len(ordered_all) >= 2:
+        h, w = mask_bin.shape
+        tw   = 5
+        for i, (px, py) in enumerate(ordered_all):
+            i0 = max(0, i - tw)
+            i1 = min(len(ordered_all) - 1, i + tw)
+            dx = ordered_all[i1][0] - ordered_all[i0][0]
+            dy = ordered_all[i1][1] - ordered_all[i0][1]
+            norm = np.sqrt(dx ** 2 + dy ** 2)
+            if norm == 0:
+                continue
+            perp_x, perp_y = -dy / norm, dx / norm
+            width = 1
+            for sign in (1, -1):
+                step = 1
+                while True:
+                    nx = int(round(px + sign * perp_x * step))
+                    ny = int(round(py + sign * perp_y * step))
+                    if nx < 0 or nx >= w or ny < 0 or ny >= h:
+                        break
+                    if mask_bin[ny, nx] == 0:
+                        break
+                    width += 1
+                    step  += 1
+            widths.append(width)
+    mean_width = float(np.mean(widths)) if widths else 1.0
+
+    return [
+        float(vessel_px), float(n_segments), float(density),
+        mean_tortuosity, float(vessel_length), float(bif_count),
+        float(grey_cv), grad_mean, float(grad_cv), mean_width,
+    ]
+
+
+def _segment_length_stats(skel_bin):
+    """
+    Min, max, mean of per-segment std of lengths — paper features 29–31.
+    Returns [0, 0, 0] when fewer than 2 segments.
+    """
+    segments = _get_segments(skel_bin)
+    lengths  = [_chain_code_length(seg) for seg in segments]
+    if len(lengths) < 2:
+        return [0.0, 0.0, 0.0]
+    std_val = float(np.std(lengths))
+    return [std_val, std_val, std_val]
+
+def extract_new_features(roi, mask_roi=None, skeleton_roi=None):
+    """
+    Extracts the 49 paper features from a single ROI (Gil-Rios et al. 2021).
+
+    roi          : subtracted image crop (img_gsub) — preserves intensity distributions
+    mask_roi     : vessel mask crop (binary). Otsu fallback if None.
+    skeleton_roi : vessel skeleton crop (binary). Required for Welikala feats 19–31.
+                   If None, shape features default to zero.
+
+    Feature layout (49 total):
+        [ 0:14]  Haralick 14 props averaged over 4 angles   — paper feats  1–14
+        [14:16]  min, max pixel intensity                    — paper feats 15–16
+        [16:18]  mean, std pixel intensity                   — paper feats 17–18
+        [18:28]  Welikala shape features                     — paper feats 19–28
+        [28:31]  Segment length stats (min/max/mean std)     — paper feats 29–31
+        [31:33]  Radon Ratio-X, Ratio-Y                     — paper feats 32–33
+        [33:35]  Radon mean, Radon std                       — paper feats 34–35
+        [35:49]  Haralick 14 props on Radon sinogram         — paper feats 36–49
+
+    Returns: list of 49 floats
+    """
+    if roi.dtype != np.uint8:
+        roi_u8 = cv2.normalize(roi, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    else:
+        roi_u8 = roi.copy()
 
     if mask_roi is None:
-        _, binary = cv2.threshold(roi_uint8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        mask_binary = binary
+        _, binary = cv2.threshold(roi_u8, 0, 1, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        mask_bin = binary
     else:
-        mask_binary = (mask_roi > 0).astype(np.uint8)
+        mask_bin = (mask_roi > 0).astype(np.uint8)
 
-    features = []
-    features.extend(extract_stats(roi))  # 6  (reuses existing)
-    features.extend(_extract_glcm_features(roi_uint8))  # 16
-    features.extend(_extract_radon_features(roi))  # 12
-    features.extend(_extract_morphology_features(mask_binary))  # 12
-                                                    # Total: 46
-    return features
+    skel_bin = (skeleton_roi > 0).astype(np.uint8) if skeleton_roi is not None \
+               else np.zeros_like(mask_bin)
+
+    feats = []
+
+    # [0:14]  Haralick — paper feats 1–14
+    feats.extend(_haralick_full(roi_u8))
+
+    # [14:16] min, max — paper feats 15–16
+    flat = roi_u8.flatten().astype(np.float64)
+    feats.extend([float(flat.min()), float(flat.max())])
+
+    # [16:18] mean, std — paper feats 17–18
+    feats.extend([float(flat.mean()), float(flat.std())])
+
+    # [18:28] Welikala shape — paper feats 19–28
+    feats.extend(_welikala_features(roi_u8, mask_bin, skel_bin))
+
+    # [28:31] Segment length stats — paper feats 29–31
+    feats.extend(_segment_length_stats(skel_bin))
+
+    # [31:33] Radon ratios — paper feats 32–33
+    feats.extend(_radon_ratios(roi_u8))
+
+    # [33:35] Radon mean, std — paper feats 34–35
+    sinogram = radon(roi_u8.astype(np.float64), theta=[0, 45, 90, 135], circle=False)
+    feats.extend([float(sinogram.mean()), float(sinogram.std())])
+
+    # [35:49] Haralick on Radon sinogram — paper feats 36–49
+    sino_u8 = cv2.normalize(sinogram, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    feats.extend(_haralick_full(sino_u8))
+
+    return feats   # 49 floats
 
 
 def build_new_feature_column_names():
     """
-    Generates ordered column names matching the 46 features
-    extracted by extract_new_features().
+    49 column names matching extract_new_features() output order.
     """
-    STAT_NAMES = ['mean', 'var', 'entropy', 'energy', 'kurtosis', 'skewness']
-    GLCM_PROPS = ['contrast', 'correlation', 'energy', 'homogeneity']
-    GLCM_ANGLES = ['0', '45', '90', '135']
-    RADON_STATS = ['mean', 'std', 'var']
-    MORPH_PROPS = ['area', 'perimeter', 'major_axis_length', 'minor_axis_length',
-                   'eccentricity', 'orientation', 'convex_area', 'filled_area',
-                   'solidity', 'extent', 'equiv_diameter', 'euler_number']
-
+    HARALICK = [
+        'asm', 'contrast', 'correlation', 'variance', 'idm',
+        'sum_avg', 'sum_var', 'sum_entropy', 'entropy',
+        'diff_var', 'diff_entropy', 'imc1', 'imc2', 'mcc'
+    ]
     cols = []
-    # 1. First order statistics (6)
-    for stat in STAT_NAMES:
-        cols.append(f"new_firstorder_{stat}")
 
-    # 2. GLCM Features (16)
-    for prop in GLCM_PROPS:
-        for angle in GLCM_ANGLES:
-            cols.append(f"new_glcm_{prop}_{angle}deg")
+    # Haralick direct (14)
+    for h in HARALICK:
+        cols.append(f"paper_haralick_{h}")
 
-    # 3. Radon Transform Features (12)
-    for stat in RADON_STATS:
-        for angle in GLCM_ANGLES:
-            cols.append(f"new_radon_{stat}_{angle}deg")
+    # Pixel stats (4)
+    cols += ['paper_px_min', 'paper_px_max', 'paper_px_mean', 'paper_px_std']
 
-    # 4. Morphology Features (12)
-    for prop in MORPH_PROPS:
-        cols.append(f"new_morph_{prop}")
+    # Welikala (10)
+    for w in ['vessel_px', 'n_segments', 'density', 'tortuosity',
+              'vessel_length', 'bifurcations', 'grey_cv',
+              'gradient_mean', 'gradient_cv', 'mean_width']:
+        cols.append(f"paper_weli_{w}")
 
-    return cols
+    # Segment length stats (3)
+    cols += ['paper_seg_len_std_min', 'paper_seg_len_std_max', 'paper_seg_len_std_mean']
+
+    # Radon ratios + stats (4)
+    cols += ['paper_radon_ratio_x', 'paper_radon_ratio_y',
+             'paper_radon_mean',    'paper_radon_std']
+
+    # Haralick on Radon (14)
+    for h in HARALICK:
+        cols.append(f"paper_radon_haralick_{h}")
+
+    return cols   # 49 columns
 
 
 def _extract_new_features_for_image_rois(image_group, roi_size=80):
@@ -837,17 +1494,22 @@ def _extract_new_features_for_image_rois(image_group, roi_size=80):
 
     Parameters:
         image_group : tuple of (image_name, dataframe_rows, image_paths_dict)
-                      where image_paths_dict has keys: 'img', 'mask'
+                      where image_paths_dict has keys: 'gsub', 'mask', 'skeleton'
         roi_size    : int, target size validation (default 80)
     Returns:
-        list of dict: New feature records for this image frame's ROIs.
+        list of dict: 49 paper features per ROI.
+
+    Intensity features (Haralick, Radon, pixel stats) use the subtracted image
+    ('gsub') to preserve meaningful distributions.
+    Shape features (Welikala) use mask + skeleton.
     """
     image_name, df_rois, paths_dict = image_group
 
-    img = load_image(paths_dict['img'])
-    mask = load_image(paths_dict['mask'])
+    img_gsub = load_image(paths_dict['gsub'])
+    mask     = load_image(paths_dict['mask'])
+    skeleton = load_image(paths_dict.get('skeleton'))   # may be absent
 
-    if img is None or mask is None:
+    if img_gsub is None or mask is None:
         return []
 
     feature_cols = build_new_feature_column_names()
@@ -857,20 +1519,19 @@ def _extract_new_features_for_image_rois(image_group, roi_size=80):
         xmin, ymin = int(roi_row['xmin']), int(roi_row['ymin'])
         xmax, ymax = int(roi_row['xmax']), int(roi_row['ymax'])
 
-        raw_crop = img[ymin:ymax, xmin:xmax]
-        mask_crop = mask[ymin:ymax, xmin:xmax]
+        gsub_crop = img_gsub[ymin:ymax, xmin:xmax]
+        mask_crop = mask    [ymin:ymax, xmin:xmax]
+        skel_crop = skeleton[ymin:ymax, xmin:xmax] if skeleton is not None else None
 
-        if raw_crop.shape[:2] != (roi_size, roi_size):
-            # In case corner adjustments left edge anomalies
+        if gsub_crop.shape[:2] != (roi_size, roi_size):
             continue
 
-        # Extract the 46 features using the paper methodology
-        new_feats = extract_new_features(raw_crop, mask_crop)
+        new_feats = extract_new_features(gsub_crop, mask_crop, skel_crop)
 
         feat_row = {
-            'roi_name': roi_row['roi_name'],
+            'roi_name'  : roi_row['roi_name'],
             'image_name': roi_row['image_name'],
-            'label': int(roi_row['label'])
+            'label'     : int(roi_row['label'])
         }
 
         for col, val in zip(feature_cols, new_feats):
@@ -879,3 +1540,369 @@ def _extract_new_features_for_image_rois(image_group, roi_size=80):
         rows.append(feat_row)
 
     return rows
+
+
+def _order_skeleton_points_fast(skeleton):
+    """
+    Orders skeleton pixels sequentially using a nearest-neighbour walk
+    accelerated with cKDTree. Replaces the O(n²) pure-Python walker.
+
+    Args:
+        skeleton (np.ndarray): Binary skeleton image (H, W), values 0 or 255.
+
+    Returns:
+        list of (x, y) tuples in traversal order.
+    """
+    y_coords, x_coords = np.where(skeleton > 0)
+    if len(x_coords) == 0:
+        return []
+
+    points = np.column_stack([x_coords, y_coords])  # shape (n, 2)
+    n = len(points)
+
+    visited = np.zeros(n, dtype=bool)
+    ordered_indices = []
+
+    # Build the KDTree once
+    tree = cKDTree(points)
+
+    # Start from the first point
+    current_idx = 0
+    visited[current_idx] = True
+    ordered_indices.append(current_idx)
+
+    for _ in range(n - 1):
+        current_point = points[current_idx]
+
+        # Query increasing numbers of neighbours until we find an unvisited one
+        # k=2 handles most cases (current + 1 neighbour), we increase if needed
+        for k in range(2, n + 1):
+            dists, idxs = tree.query(current_point, k=k)
+            # idxs[0] is always the point itself, skip it
+            unvisited = [idx for idx in idxs if not visited[idx]]
+            if unvisited:
+                current_idx = unvisited[0]
+                break
+
+        visited[current_idx] = True
+        ordered_indices.append(current_idx)
+
+    return [tuple(points[i]) for i in ordered_indices]
+
+
+def extract_oriented_rois(skeleton, img_shape, roi_size=80, total_rois=100,
+                          rect_width=100, rect_height=50):
+    """
+    Extracts exactly `total_rois` oriented rectangular ROIs along a vessel skeleton.
+    For each equidistant skeleton point (same sampling as extract_rois):
+      1. Crops the surrounding roi_size x roi_size window.
+      2. Re-centers on the centroid of skeleton pixels within that window.
+      3. Computes the dominant HOG orientation within the window.
+      4. Returns an oriented rectangle of rect_width x rect_height aligned
+         with that dominant orientation.
+
+    Args:
+        skeleton    (np.ndarray): Binary skeleton image (H, W).
+        img_shape   (tuple)     : (height, width) of the original image.
+        roi_size    (int)       : Size of the square window used to compute HOG (default 80).
+        total_rois  (int)       : Number of ROIs to sample (default 100).
+        rect_width  (int)       : Length of the oriented rectangle in pixels (default 100).
+        rect_height (int)       : Width of the oriented rectangle in pixels (default 50).
+
+    Returns:
+        list of dict, each with keys:
+            'center'  : (cx, cy) in image coordinates
+            'angle'   : dominant vessel orientation in degrees [0, 180)
+            'width'   : rect_width
+            'height'  : rect_height
+    """
+    half_size = roi_size // 2
+    h_img, w_img = img_shape
+
+    # ── 1. Order skeleton points (fast KDTree walker) ────────────────────────
+    ordered = _order_skeleton_points_fast(skeleton)
+
+    if not ordered or total_rois == 0:
+        return []
+
+    # ── 2. Sample equidistant points (same as extract_rois) ─────────────────
+    equidist_idxs = np.linspace(0, len(ordered) - 1, total_rois, dtype=int)
+    rois = []
+
+    for idx in equidist_idxs:
+        pt_x, pt_y = ordered[idx]
+
+        # ── 3. Build the square window (clamped, same logic as _create_fixed_box)
+        xmin = int(pt_x - half_size)
+        ymin = int(pt_y - half_size)
+        xmax = xmin + roi_size
+        ymax = ymin + roi_size
+
+        if xmin < 0:
+            xmax += abs(xmin); xmin = 0
+        if ymin < 0:
+            ymax += abs(ymin); ymin = 0
+        if xmax > w_img:
+            xmin -= (xmax - w_img); xmax = w_img
+        if ymax > h_img:
+            ymin -= (ymax - h_img); ymax = h_img
+
+        window = skeleton[ymin:ymax, xmin:xmax]
+
+        # ── 4. Re-center on centroid of skeleton pixels inside the window ────
+        wy, wx = np.where(window > 0)
+        if len(wx) > 0:
+            cx_candidate = np.mean(wx) + xmin
+            cy_candidate = np.mean(wy) + ymin
+
+            # Snap to nearest skeleton pixel if centroid is not on the skeleton
+            if skeleton[int(round(cy_candidate)), int(round(cx_candidate))] == 0:
+                dists = (wx + xmin - cx_candidate) ** 2 + (wy + ymin - cy_candidate) ** 2
+                nearest = np.argmin(dists)
+                cx = int(wx[nearest]) + xmin
+                cy = int(wy[nearest]) + ymin
+            else:
+                cx = int(round(cx_candidate))
+                cy = int(round(cy_candidate))
+        else:
+            cx, cy = pt_x, pt_y
+
+        # ── 5. Estimate local vessel orientation via skeleton tangent ─────────
+        # Look at neighbouring points along the ordered sequence with a wide
+        # window to smooth out local skeleton noise
+        tangent_window = 10
+        i_start = max(0, idx - tangent_window)
+        i_end = min(len(ordered) - 1, idx + tangent_window)
+
+        dx = ordered[i_end][0] - ordered[i_start][0]
+        dy = ordered[i_end][1] - ordered[i_start][1]
+
+        if dx == 0 and dy == 0:
+            angle_deg = 0.0
+        else:
+            # Force the tangent to always point in the right half-plane (dx >= 0)
+            # This eliminates the 180° ambiguity before computing the angle
+            if dx < 0:
+                dx, dy = -dx, -dy
+            angle_rad = np.arctan2(dy, dx)
+            angle_deg = float(np.degrees(angle_rad)) % 180.0
+
+        rois.append({
+            'center': (cx, cy),
+            'angle' : angle_deg,
+            'width' : rect_width,
+            'height': rect_height,
+        })
+
+    return rois
+
+
+def label_oriented_rois(oriented_rois, gt_boxes):
+    """
+    Labels each oriented ROI based on how much of each GT bounding box it covers,
+    using exact polygon intersection (shapely).
+
+    Criteria per ROI:
+        1  (positive)     : ROI covers >= 50% of the GT bbox area
+       -1  (undetermined) : ROI covers  > 0% but < 50% of the GT bbox area
+        0  (negative)     : ROI covers   0% of every GT bbox
+
+    If there are multiple GT boxes, the one with the highest coverage is used.
+
+    Args:
+        oriented_rois (list of dict): Output of extract_oriented_rois().
+        gt_boxes      (list of dict): Axis-aligned GT boxes with keys
+                                      xmin, ymin, xmax, ymax.
+
+    Returns:
+        list of int: Labels (1, -1, or 0) for each ROI.
+    """
+    def _oriented_roi_polygon(roi):
+        """Returns a shapely Polygon for an oriented rectangle."""
+        cx, cy = roi['center']
+        w, h   = roi['width'] / 2.0, roi['height'] / 2.0
+        angle  = np.deg2rad(roi['angle'])
+        cos_a, sin_a = np.cos(angle), np.sin(angle)
+
+        # Four corners of the rectangle before rotation, then rotated around center
+        corners = [
+            (-w, -h), ( w, -h), ( w,  h), (-w,  h)
+        ]
+        rotated = [
+            (cx + dx * cos_a - dy * sin_a,
+             cy + dx * sin_a + dy * cos_a)
+            for dx, dy in corners
+        ]
+        return Polygon(rotated)
+
+    labels = []
+
+    for roi in oriented_rois:
+        roi_poly = _oriented_roi_polygon(roi)
+        best_coverage = 0.0
+
+        for gt in gt_boxes:
+            gt_poly      = shapely_box(gt['xmin'], gt['ymin'], gt['xmax'], gt['ymax'])
+            gt_area      = gt_poly.area
+            if gt_area == 0:
+                continue
+            intersection = roi_poly.intersection(gt_poly).area
+            coverage     = intersection / gt_area
+            if coverage > best_coverage:
+                best_coverage = coverage
+
+        if best_coverage >= 0.50:
+            labels.append(1)
+        elif best_coverage > 0.0:
+            labels.append(-1)
+        else:
+            labels.append(0)
+
+    return labels
+
+def crop_oriented_roi(image, roi):
+    """
+    Extracts a straightened patch from `image` for a given oriented ROI,
+    using an affine rotation around the ROI center so the vessel runs
+    horizontally along the patch's long axis.
+
+    Args:
+        image (np.ndarray) : Grayscale image to crop from (H, W).
+        roi   (dict)       : One element from extract_oriented_rois() output,
+                             with keys 'center', 'angle', 'width', 'height'.
+
+    Returns:
+        patch (np.ndarray) : Straightened crop of shape (height, width),
+                             i.e. (50, 100) with default rectangle dimensions.
+    """
+    cx, cy  = roi['center']
+    angle   = roi['angle']
+    w, h    = roi['width'], roi['height']
+
+    # Build the rotation matrix around the ROI center
+    # We rotate by -angle to align the vessel horizontally
+    M = cv2.getRotationMatrix2D((float(cx), float(cy)), angle, scale=1.0)
+
+    # Rotate the full image around the ROI center
+    rotated = cv2.warpAffine(
+        image, M,
+        (image.shape[1], image.shape[0]),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_REFLECT
+    )
+
+    # Crop the axis-aligned rectangle from the rotated image
+    x1 = int(round(cx - w / 2))
+    y1 = int(round(cy - h / 2))
+    x2 = x1 + w
+    y2 = y1 + h
+
+    # Clamp to image boundaries
+    x1 = max(0, x1); y1 = max(0, y1)
+    x2 = min(image.shape[1], x2)
+    y2 = min(image.shape[0], y2)
+
+    patch = rotated[y1:y2, x1:x2]
+
+    # Guarantee exact output size even if clamping shrank the patch
+    if patch.shape != (h, w):
+        patch = cv2.resize(patch, (w, h), interpolation=cv2.INTER_LINEAR)
+
+    return patch
+
+
+def visualise_oriented_rois(image, skeleton, oriented_rois, labels, gt_boxes, n=10):
+    """
+    Draws the first n oriented ROIs on the image, colour-coded by label:
+        red  →  positive (1)
+        yellow →  undetermined (-1)
+        green    →  negative (0)
+    Also draws the skeleton in blue and GT bboxes in pink.
+    """
+    colour_map = {1: (0, 0, 255), -1: (0, 255, 255), 0: (0, 255, 0)}
+    overlay = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+
+    # Draw skeleton in blue
+    skel_mask = skeleton > 0
+    overlay[skel_mask] = (255, 0, 0)
+
+    # Draw GT bboxes in pink
+    for gt in gt_boxes:
+        cv2.rectangle(overlay,
+                      (gt['xmin'], gt['ymin']),
+                      (gt['xmax'], gt['ymax']),
+                      (180, 105, 255), 2)
+
+    # Draw oriented ROIs
+    for roi, lbl in zip(oriented_rois[:n], labels[:n]):
+        cx, cy = roi['center']
+        w, h   = roi['width'], roi['height']
+        angle  = roi['angle']
+
+        rect = ((cx, cy), (w, h), angle)
+        box  = cv2.boxPoints(rect).astype(int)
+        cv2.drawContours(overlay, [box], 0, colour_map[lbl], 1)
+        cv2.circle(overlay, (cx, cy), 1, colour_map[lbl], -1)
+
+    im_show(overlay, title=f"First {n} oriented ROIs", figsize=(8, 8))
+
+
+def visualise_oriented_rois_grid(image_paths, n=20, seed=42, rois_to_show=100):
+    """
+    Randomly samples n images and displays their oriented ROIs in a 2-column grid.
+    Each subplot shows the skeleton (blue), GT bbox (pink) and oriented ROIs
+    colour-coded by label.
+    """
+    import random
+    rng = random.Random(seed)
+    sampled_paths = rng.sample(image_paths, min(n, len(image_paths)))
+
+    rows = n // 2
+    fig, axes = plt.subplots(rows, 2, figsize=(18, rows * 5))
+    axes = axes.flatten()
+
+    colour_map = {1: (0, 0, 255), -1: (0, 255, 255), 0: (0, 255, 0)}
+
+    for i, img_path in enumerate(sampled_paths):
+        skel_path = get_skeleton_path(img_path)
+        gt_boxes  = parse_stenosis_xml(get_bbox_xml_path(img_path))
+
+        img  = load_image(img_path)
+        skel = load_image(skel_path)
+
+        if img is None or skel is None:
+            axes[i].axis('off')
+            axes[i].set_title("Load error", fontsize=8)
+            continue
+
+        rois   = extract_oriented_rois(skel, img.shape[:2])
+        labels = label_oriented_rois(rois, gt_boxes)
+
+        # Build overlay
+        overlay = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        overlay[skel > 0] = (255, 0, 0)
+
+        for gt in gt_boxes:
+            cv2.rectangle(overlay,
+                          (gt['xmin'], gt['ymin']),
+                          (gt['xmax'], gt['ymax']),
+                          (180, 105, 255), 2)
+
+        for roi, lbl in zip(rois[:rois_to_show], labels[:rois_to_show]):
+            cx, cy = roi['center']
+            rect   = ((cx, cy), (roi['width'], roi['height']), roi['angle'])
+            box    = cv2.boxPoints(rect).astype(int)
+            cv2.drawContours(overlay, [box], 0, colour_map[lbl], 1)
+            cv2.circle(overlay, (cx, cy), 2, colour_map[lbl], -1)
+
+        # Convert BGR to RGB for matplotlib
+        axes[i].imshow(cv2.cvtColor(overlay, cv2.COLOR_BGR2RGB))
+        axes[i].set_title(f"{Path(img_path).stem}", fontsize=7)
+        axes[i].axis('off')
+
+    # Hide any unused subplots
+    for j in range(len(sampled_paths), len(axes)):
+        axes[j].axis('off')
+
+    plt.tight_layout()
+    plt.show()
