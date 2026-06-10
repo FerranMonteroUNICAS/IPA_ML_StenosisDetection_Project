@@ -852,6 +852,7 @@ def process_one_image_oriented(args):
         y_skel, x_skel = np.where(skeleton > 0)
         skel_pts       = np.column_stack([x_skel, y_skel])
         ordered        = _order_skeleton_points_fast(skeleton)
+        ordered_lookup = {pt: i for i, pt in enumerate(ordered)}
 
         for gt_box in gt_boxes:
             cx_gt = (gt_box['xmin'] + gt_box['xmax']) // 2
@@ -864,7 +865,7 @@ def process_one_image_oriented(args):
 
                 # Find its index in the ordered sequence for tangent estimation
                 try:
-                    nearest_idx = ordered.index(nearest_pt)
+                    nearest_idx = ordered_lookup[nearest_pt]
                 except ValueError:
                     # Point not in ordered list (shouldn't happen) — use GT centre
                     nearest_idx = None
@@ -945,6 +946,100 @@ def process_one_image_oriented(args):
 
     except Exception:
         print(f"[WORKER ERROR] {img_path}", flush=True)
+        print(traceback.format_exc(), flush=True)
+        return []
+
+
+def process_one_image_coords_oriented(args):
+    """
+    Lightweight worker — extracts oriented ROI geometry and labels only,
+    no feature extraction. Much faster than process_one_image_oriented.
+
+    Args:
+        args : tuple of (img_path, mask_path, skel_path, gt_boxes,
+                         total_rois, rect_width, rect_height)
+
+    Returns:
+        list of dicts with keys: roi_name, image_name,
+        center_x, center_y, angle, width, height, label.
+    """
+    import traceback
+    (img_path, mask_path, skel_path, gt_boxes,
+     total_rois, rect_width, rect_height) = args
+
+    try:
+        img      = load_image(img_path)
+        skeleton = load_image(skel_path)
+        mask     = load_image(mask_path)
+
+        if img is None or skeleton is None or mask is None:
+            return []
+
+        img_shape  = img.shape[:2]
+        p          = Path(img_path)
+        patient_id = p.parts[-3]
+        serie_id   = p.parts[-2]
+        frame_stem = p.stem.replace('_processed', '')
+        image_name = f"{patient_id}_{serie_id}_{frame_stem}"
+
+        oriented_rois = extract_oriented_rois(
+            skeleton, img_shape,
+            total_rois=total_rois,
+            rect_width=rect_width,
+            rect_height=rect_height
+        )
+
+        # GT-centred ROI
+        y_skel, x_skel = np.where(skeleton > 0)
+        skel_pts       = np.column_stack([x_skel, y_skel]) if len(x_skel) > 0 else np.empty((0, 2))
+        ordered        = _order_skeleton_points_fast(skeleton)
+
+        ordered_lookup = {pt: i for i, pt in enumerate(ordered)}
+
+        for gt_box in gt_boxes:
+            cx_gt = (gt_box['xmin'] + gt_box['xmax']) // 2
+            cy_gt = (gt_box['ymin'] + gt_box['ymax']) // 2
+
+            if len(skel_pts) > 0:
+                dists      = np.sum((skel_pts - np.array([cx_gt, cy_gt])) ** 2, axis=1)
+                nearest_pt = tuple(skel_pts[np.argmin(dists)])
+                try:
+                    nearest_idx = ordered_lookup[nearest_pt]
+                    tw      = 10
+                    i_start = max(0, nearest_idx - tw)
+                    i_end   = min(len(ordered) - 1, nearest_idx + tw)
+                    dx = ordered[i_end][0] - ordered[i_start][0]
+                    dy = ordered[i_end][1] - ordered[i_start][1]
+                    if dx < 0: dx, dy = -dx, -dy
+                    angle_deg = float(np.degrees(np.arctan2(dy, dx))) % 180.0 if (dx or dy) else 0.0
+                    cx, cy = nearest_pt
+                except ValueError:
+                    angle_deg, cx, cy = 0.0, cx_gt, cy_gt
+            else:
+                angle_deg, cx, cy = 0.0, cx_gt, cy_gt
+
+            oriented_rois.append({
+                'center': (cx, cy), 'angle': angle_deg,
+                'width': rect_width, 'height': rect_height,
+            })
+
+        labels = label_oriented_rois(oriented_rois, gt_boxes)
+
+        rows = []
+        for roi_idx, (roi, lbl) in enumerate(zip(oriented_rois, labels), start=1):
+            rows.append({
+                'roi_name'  : f"{image_name}_{roi_idx}",
+                'image_name': image_name,
+                'center_x'  : roi['center'][0],
+                'center_y'  : roi['center'][1],
+                'angle'     : roi['angle'],
+                'width'     : roi['width'],
+                'height'    : roi['height'],
+                'label'     : lbl,
+            })
+        return rows
+
+    except Exception:
         print(traceback.format_exc(), flush=True)
         return []
 
@@ -1542,47 +1637,34 @@ def _extract_new_features_for_image_rois(image_group, roi_size=80):
 
 
 def _order_skeleton_points_fast(skeleton):
-    """
-    Orders skeleton pixels sequentially using a nearest-neighbour walk
-    accelerated with cKDTree. Replaces the O(n²) pure-Python walker.
-
-    Args:
-        skeleton (np.ndarray): Binary skeleton image (H, W), values 0 or 255.
-
-    Returns:
-        list of (x, y) tuples in traversal order.
-    """
     y_coords, x_coords = np.where(skeleton > 0)
     if len(x_coords) == 0:
         return []
 
-    points = np.column_stack([x_coords, y_coords])  # shape (n, 2)
+    points = np.column_stack([x_coords, y_coords])
     n = len(points)
-
     visited = np.zeros(n, dtype=bool)
     ordered_indices = []
-
-    # Build the KDTree once
     tree = cKDTree(points)
 
-    # Start from the first point
     current_idx = 0
     visited[current_idx] = True
     ordered_indices.append(current_idx)
 
+    # Query a fixed small neighborhood (e.g. 10) — enough for any real skeleton
+    K = min(10, n)
     for _ in range(n - 1):
         current_point = points[current_idx]
-
-        # Query increasing numbers of neighbours until we find an unvisited one
-        # k=2 handles most cases (current + 1 neighbour), we increase if needed
-        for k in range(2, n + 1):
-            dists, idxs = tree.query(current_point, k=k)
-            # idxs[0] is always the point itself, skip it
-            unvisited = [idx for idx in idxs if not visited[idx]]
-            if unvisited:
-                current_idx = unvisited[0]
-                break
-
+        _, idxs = tree.query(current_point, k=K)
+        unvisited = [i for i in (idxs if K > 1 else [idxs]) if not visited[i]]
+        if not unvisited:
+            # Skeleton has a gap — find the global nearest unvisited point
+            unvisited_pts = points[~visited]
+            unvisited_idxs = np.where(~visited)[0]
+            dists = np.sum((unvisited_pts - current_point) ** 2, axis=1)
+            current_idx = unvisited_idxs[np.argmin(dists)]
+        else:
+            current_idx = unvisited[0]
         visited[current_idx] = True
         ordered_indices.append(current_idx)
 
@@ -1692,13 +1774,6 @@ def extract_oriented_rois(skeleton, img_shape, roi_size=80, total_rois=100,
             'width' : rect_width,
             'height': rect_height,
         })
-
-        print(f"Skeleton pixels   : {np.sum(skeleton > 0)}")
-        print(f"Ordered points    : {len(ordered)}")
-        print(f"Equidist indices  : {len(equidist_idxs)}")
-        print(f"Unique indices    : {len(set(equidist_idxs))}")
-        print(f"ROIs returned     : {len(rois)}")
-
     return rois
 
 
