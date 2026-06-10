@@ -1,0 +1,2 @@
+kernel     deg  coef0     log2(g)        log2(C)        measure_1=val ... measure_n=val
+RBF        3    0         -6.04386       3.4            ACCURACY=0.747155             PRECISION=0.684759            F1=0.570887                   CLASSERROR=0.252845           

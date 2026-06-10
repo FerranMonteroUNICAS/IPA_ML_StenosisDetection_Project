@@ -814,7 +814,7 @@ def process_one_image_oriented(args):
 
     try:
         t_start = time.time()
-        print(f"[WORKER] ── START ── {img_path}", flush=True)
+        print(f"[WORKER] ── START ── {Path(img_path).name}", flush=True)
 
         # ── 1. Load images ────────────────────────────────────────────────────
         img      = load_image(img_path)
@@ -940,8 +940,7 @@ def process_one_image_oriented(args):
 
             rows.append(row)
 
-        print(f"[WORKER] ── DONE {image_name} — {len(rows)} rows "
-              f"in {time.time()-t_start:.2f}s ──", flush=True)
+        print(f"[WORKER] ── DONE {image_name} — {len(rows)} ROIs extracted in {time.time() - t_start:.2f}s ──", flush=True)
         return rows
 
     except Exception:
@@ -1693,6 +1692,12 @@ def extract_oriented_rois(skeleton, img_shape, roi_size=80, total_rois=100,
             'width' : rect_width,
             'height': rect_height,
         })
+
+        print(f"Skeleton pixels   : {np.sum(skeleton > 0)}")
+        print(f"Ordered points    : {len(ordered)}")
+        print(f"Equidist indices  : {len(equidist_idxs)}")
+        print(f"Unique indices    : {len(set(equidist_idxs))}")
+        print(f"ROIs returned     : {len(rois)}")
 
     return rois
 

@@ -1,0 +1,3 @@
+  iter       trainPOS       trainNEG       trainTPR       trainFPR       trainACC        trainF1        tankNEG        tankFPR
+     1           1897           3794         58.777        9.67317        79.8102        65.9959          26430        27.8736
+     2           1897           3794        57.8281        10.2794        79.0898        64.8345           7317        95.9136
