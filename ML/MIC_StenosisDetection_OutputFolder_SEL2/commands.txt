@@ -1,0 +1,1 @@
+--pos_path=/home/stenosisproject/pos.csv --pos_format=csv --neg_path=/home/stenosisproject/neg.csv --neg_format=csv --feature_type=sample --output=/home/stenosisproject/MIC_StenosisDetection_OutputFolder_SEL2 --folds=10 --SEL_i=2 -M -j=60 --lowRAM 

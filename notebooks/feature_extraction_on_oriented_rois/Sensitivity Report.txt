@@ -1,0 +1,11 @@
+════════════════════════════════════════════════════
+  PIPELINE SENSITIVITY REPORT
+════════════════════════════════════════════════════
+  Total annotated images            : 8325
+  Images with ≥1 positive ROI       : 7788
+  Images with 0 positive ROIs       : 537
+  Sensitivity                       : 0.9355  (93.55%)
+────────────────────────────────────────────────────
+  Avg positive ROIs / image (all)   : 3.919
+  Avg positive ROIs / image (detected only): 4.190
+════════════════════════════════════════════════════
